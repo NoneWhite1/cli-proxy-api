@@ -75,6 +75,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.WebsocketAuth != newCfg.WebsocketAuth {
 		changes = append(changes, fmt.Sprintf("ws-auth: %t -> %t", oldCfg.WebsocketAuth, newCfg.WebsocketAuth))
 	}
+	if oldCfg.CodexForceWebsockets != newCfg.CodexForceWebsockets {
+		changes = append(changes, fmt.Sprintf("codex-force-websockets: %t -> %t", oldCfg.CodexForceWebsockets, newCfg.CodexForceWebsockets))
+	}
 	if oldCfg.ForceModelPrefix != newCfg.ForceModelPrefix {
 		changes = append(changes, fmt.Sprintf("force-model-prefix: %t -> %t", oldCfg.ForceModelPrefix, newCfg.ForceModelPrefix))
 	}
