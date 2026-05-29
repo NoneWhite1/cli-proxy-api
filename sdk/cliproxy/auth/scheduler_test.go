@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
@@ -558,5 +559,223 @@ func TestManager_SchedulerTracksMarkResultCooldownAndRecovery(t *testing.T) {
 	}
 	if len(seen) != 2 {
 		t.Fatalf("len(seen) = %d, want %d", len(seen), 2)
+	}
+}
+
+func TestManager_PickNextAutoRecoversExpiredQuotaState(t *testing.T) {
+	ctx := context.Background()
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.RegisterExecutor(schedulerTestExecutor{})
+
+	const model = "quota-auto-recovery-model"
+	registerSchedulerModels(t, "test", model, "quota-auto-a", "quota-auto-b")
+	if _, errRegister := manager.Register(ctx, &Auth{ID: "quota-auto-a", Provider: "test"}); errRegister != nil {
+		t.Fatalf("Register(quota-auto-a) error = %v", errRegister)
+	}
+	if _, errRegister := manager.Register(ctx, &Auth{ID: "quota-auto-b", Provider: "test"}); errRegister != nil {
+		t.Fatalf("Register(quota-auto-b) error = %v", errRegister)
+	}
+
+	retryAfter := time.Hour
+	manager.MarkResult(ctx, Result{
+		AuthID:     "quota-auto-a",
+		Provider:   "test",
+		Model:      model,
+		Success:    false,
+		RetryAfter: &retryAfter,
+		Error:      &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota"},
+	})
+
+	got, _, errPick := manager.pickNext(ctx, "test", model, cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickNext() during cooldown error = %v", errPick)
+	}
+	if got == nil || got.ID != "quota-auto-b" {
+		t.Fatalf("pickNext() during cooldown auth = %v, want quota-auto-b", got)
+	}
+
+	past := time.Now().Add(-time.Minute)
+	manager.mu.Lock()
+	stored := manager.auths["quota-auto-a"]
+	state := stored.ModelStates[model]
+	state.NextRetryAfter = past
+	state.Quota.NextRecoverAt = past
+	stored.NextRetryAfter = past
+	stored.Quota.NextRecoverAt = past
+	manager.mu.Unlock()
+
+	got, _, errPick = manager.pickNext(ctx, "test", model, cliproxyexecutor.Options{}, map[string]struct{}{"quota-auto-b": {}})
+	if errPick != nil {
+		t.Fatalf("pickNext() after quota recovery time error = %v", errPick)
+	}
+	if got == nil || got.ID != "quota-auto-a" {
+		t.Fatalf("pickNext() after quota recovery time auth = %v, want quota-auto-a", got)
+	}
+
+	recovered, ok := manager.GetByID("quota-auto-a")
+	if !ok {
+		t.Fatal("expected quota-auto-a to remain registered")
+	}
+	recoveredState := recovered.ModelStates[model]
+	if recoveredState == nil {
+		t.Fatalf("ModelStates[%q] = nil", model)
+	}
+	if recoveredState.Unavailable {
+		t.Fatal("recovered model state Unavailable = true, want false")
+	}
+	if !recoveredState.NextRetryAfter.IsZero() {
+		t.Fatalf("recovered model NextRetryAfter = %s, want zero", recoveredState.NextRetryAfter)
+	}
+	if recoveredState.Quota.Exceeded || !recoveredState.Quota.NextRecoverAt.IsZero() {
+		t.Fatalf("recovered model quota = %+v, want cleared", recoveredState.Quota)
+	}
+	if recovered.Quota.Exceeded || !recovered.Quota.NextRecoverAt.IsZero() {
+		t.Fatalf("recovered auth quota = %+v, want cleared", recovered.Quota)
+	}
+	if count := registry.GetGlobalRegistry().GetModelCount(model); count != 2 {
+		t.Fatalf("GetModelCount(%q) = %d, want 2 after quota recovery", model, count)
+	}
+}
+
+func TestManager_PickNextKeepsUnexpiredQuotaStateBlocked(t *testing.T) {
+	ctx := context.Background()
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.RegisterExecutor(schedulerTestExecutor{})
+
+	const model = "quota-unexpired-model"
+	registerSchedulerModels(t, "test", model, "quota-unexpired-a", "quota-unexpired-b")
+	if _, errRegister := manager.Register(ctx, &Auth{ID: "quota-unexpired-a", Provider: "test"}); errRegister != nil {
+		t.Fatalf("Register(quota-unexpired-a) error = %v", errRegister)
+	}
+	if _, errRegister := manager.Register(ctx, &Auth{ID: "quota-unexpired-b", Provider: "test"}); errRegister != nil {
+		t.Fatalf("Register(quota-unexpired-b) error = %v", errRegister)
+	}
+
+	retryAfter := time.Hour
+	manager.MarkResult(ctx, Result{
+		AuthID:     "quota-unexpired-a",
+		Provider:   "test",
+		Model:      model,
+		Success:    false,
+		RetryAfter: &retryAfter,
+		Error:      &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota"},
+	})
+
+	got, _, errPick := manager.pickNext(ctx, "test", model, cliproxyexecutor.Options{}, map[string]struct{}{"quota-unexpired-b": {}})
+	if errPick == nil {
+		t.Fatalf("pickNext() during unexpired cooldown auth = %v, want cooldown error", got)
+	}
+	recovered, ok := manager.GetByID("quota-unexpired-a")
+	if !ok {
+		t.Fatal("expected quota-unexpired-a to remain registered")
+	}
+	state := recovered.ModelStates[model]
+	if state == nil || !state.Unavailable || !state.Quota.Exceeded || state.NextRetryAfter.IsZero() || state.Quota.NextRecoverAt.IsZero() {
+		t.Fatalf("unexpired model state = %+v, want quota cooldown retained", state)
+	}
+}
+
+func TestManager_PickNextDoesNotReactivateDisabledModelQuotaState(t *testing.T) {
+	ctx := context.Background()
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.RegisterExecutor(schedulerTestExecutor{})
+
+	const model = "quota-disabled-model"
+	registerSchedulerModels(t, "test", model, "quota-disabled-a", "quota-disabled-b")
+	if _, errRegister := manager.Register(ctx, &Auth{ID: "quota-disabled-a", Provider: "test"}); errRegister != nil {
+		t.Fatalf("Register(quota-disabled-a) error = %v", errRegister)
+	}
+	if _, errRegister := manager.Register(ctx, &Auth{ID: "quota-disabled-b", Provider: "test"}); errRegister != nil {
+		t.Fatalf("Register(quota-disabled-b) error = %v", errRegister)
+	}
+
+	past := time.Now().Add(-time.Minute)
+	manager.mu.Lock()
+	stored := manager.auths["quota-disabled-a"]
+	stored.ModelStates = map[string]*ModelState{
+		model: {
+			Status:         StatusDisabled,
+			StatusMessage:  "disabled via management API",
+			Unavailable:    true,
+			NextRetryAfter: past,
+			Quota: QuotaState{
+				Exceeded:      true,
+				Reason:        "quota",
+				NextRecoverAt: past,
+			},
+			UpdatedAt: past,
+		},
+	}
+	stored.Unavailable = true
+	stored.NextRetryAfter = past
+	stored.Quota = QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: past}
+	snapshot := stored.Clone()
+	manager.mu.Unlock()
+	manager.scheduler.upsertAuth(snapshot)
+
+	got, _, errPick := manager.pickNext(ctx, "test", model, cliproxyexecutor.Options{}, map[string]struct{}{"quota-disabled-b": {}})
+	if errPick == nil {
+		t.Fatalf("pickNext() with disabled model state auth = %v, want unavailable error", got)
+	}
+	updated, ok := manager.GetByID("quota-disabled-a")
+	if !ok {
+		t.Fatal("expected quota-disabled-a to remain registered")
+	}
+	state := updated.ModelStates[model]
+	if state == nil {
+		t.Fatalf("ModelStates[%q] = nil", model)
+	}
+	if state.Status != StatusDisabled || state.StatusMessage != "disabled via management API" || !state.Quota.Exceeded {
+		t.Fatalf("disabled model state = %+v, want manual disabled quota state retained", state)
+	}
+}
+
+func TestManager_PickNextRecoversExpiredQuotaStateBeforeHomeDispatch(t *testing.T) {
+	ctx := context.Background()
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.SetConfig(&internalconfig.Config{Home: internalconfig.HomeConfig{Enabled: true}})
+	manager.RegisterExecutor(schedulerTestExecutor{})
+
+	const model = "quota-home-recovery-model"
+	registerSchedulerModels(t, "test", model, "quota-home-a")
+	if _, errRegister := manager.Register(ctx, &Auth{ID: "quota-home-a", Provider: "test"}); errRegister != nil {
+		t.Fatalf("Register(quota-home-a) error = %v", errRegister)
+	}
+
+	retryAfter := time.Hour
+	manager.MarkResult(ctx, Result{
+		AuthID:     "quota-home-a",
+		Provider:   "test",
+		Model:      model,
+		Success:    false,
+		RetryAfter: &retryAfter,
+		Error:      &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota"},
+	})
+
+	past := time.Now().Add(-time.Minute)
+	manager.mu.Lock()
+	stored := manager.auths["quota-home-a"]
+	state := stored.ModelStates[model]
+	state.NextRetryAfter = past
+	state.Quota.NextRecoverAt = past
+	stored.NextRetryAfter = past
+	stored.Quota.NextRecoverAt = past
+	manager.mu.Unlock()
+
+	_, _, errPick := manager.pickNext(ctx, "test", model, cliproxyexecutor.Options{}, nil)
+	if errPick == nil {
+		t.Fatal("pickNext() with home unavailable error = nil")
+	}
+
+	recovered, ok := manager.GetByID("quota-home-a")
+	if !ok {
+		t.Fatal("expected quota-home-a to remain registered")
+	}
+	recoveredState := recovered.ModelStates[model]
+	if recoveredState == nil {
+		t.Fatalf("ModelStates[%q] = nil", model)
+	}
+	if recoveredState.Unavailable || recoveredState.Quota.Exceeded || !recoveredState.NextRetryAfter.IsZero() || !recoveredState.Quota.NextRecoverAt.IsZero() {
+		t.Fatalf("home path recovered model state = %+v, want cleared", recoveredState)
 	}
 }

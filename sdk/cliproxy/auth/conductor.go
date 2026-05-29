@@ -78,9 +78,11 @@ const (
 	// success but the auth still evaluates as needing refresh (e.g. token expiry
 	// wasn't updated). Without this guard, the auto-refresh loop can tight-loop and
 	// burn CPU at idle.
-	refreshIneffectiveBackoff = 30 * time.Second
-	quotaBackoffBase          = time.Second
-	quotaBackoffMax           = 30 * time.Minute
+	refreshIneffectiveBackoff  = 30 * time.Second
+	quotaBackoffBase           = time.Second
+	quotaBackoffMax            = 30 * time.Minute
+	quotaAutoDisabledReason    = "codex_quota_auto_disabled"
+	quotaRecoveryCheckInterval = 10 * time.Minute
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -187,8 +189,9 @@ type Manager struct {
 	rtProvider RoundTripperProvider
 
 	// Auto refresh state
-	refreshCancel context.CancelFunc
-	refreshLoop   *authAutoRefreshLoop
+	refreshCancel     context.CancelFunc
+	refreshLoop       *authAutoRefreshLoop
+	quotaRecoveryLoop *quotaRecoveryLoop
 
 	requestPrepareLocks sync.Map
 }
@@ -1152,6 +1155,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 		m.scheduler.upsertAuth(authClone)
 	}
 	m.queueRefreshReschedule(auth.ID)
+	m.queueQuotaRecoveryFromAuth(auth.ID)
 	_ = m.persist(ctx, auth)
 	m.hook.OnAuthRegistered(ctx, auth.Clone())
 	return auth.Clone(), nil
@@ -1186,6 +1190,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		m.scheduler.upsertAuth(authClone)
 	}
 	m.queueRefreshReschedule(auth.ID)
+	m.queueQuotaRecoveryFromAuth(auth.ID)
 	_ = m.persist(ctx, auth)
 	m.hook.OnAuthUpdated(ctx, auth.Clone())
 	return auth.Clone(), nil
@@ -1218,6 +1223,7 @@ func (m *Manager) Load(ctx context.Context) error {
 	m.rebuildAPIKeyModelAliasLocked(cfg)
 	m.mu.Unlock()
 	m.syncScheduler()
+	m.rebuildQuotaRecoveryQueue()
 	return nil
 }
 
@@ -2266,6 +2272,8 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	clearModelQuota := false
 	setModelQuota := false
 	var authSnapshot *Auth
+	var quotaRecoveryAt time.Time
+	queueQuotaRecovery := false
 
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
@@ -2314,6 +2322,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						state.NextRetryAfter = next
 						suspendReason = "model_not_supported"
 						shouldSuspendModel = true
+					} else if shouldDisableAuthForNoQuota429(result.Provider, auth, result.Error) {
+						quotaRecoveryAt = markAuthAutoDisabledForQuota(auth, state, result.RetryAfter, now)
+						queueQuotaRecovery = !quotaRecoveryAt.IsZero()
 					} else {
 						switch statusCode {
 						case 401:
@@ -2381,12 +2392,17 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						}
 					}
 
-					auth.Status = StatusError
+					if !auth.Disabled && auth.Status != StatusDisabled {
+						auth.Status = StatusError
+					}
 					auth.UpdatedAt = now
 					updateAggregatedAvailability(auth, now)
 				}
 			} else {
-				applyAuthFailureState(auth, result.Error, result.RetryAfter, now)
+				if recoverAt, okRecover := applyAuthFailureState(auth, result.Provider, result.Error, result.RetryAfter, now); okRecover {
+					quotaRecoveryAt = recoverAt
+					queueQuotaRecovery = true
+				}
 			}
 		}
 
@@ -2396,6 +2412,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	m.mu.Unlock()
 	if m.scheduler != nil && authSnapshot != nil {
 		m.scheduler.upsertAuth(authSnapshot)
+	}
+	if queueQuotaRecovery {
+		m.queueQuotaRecovery(result.AuthID, quotaRecoveryAt)
 	}
 
 	if clearModelQuota && result.Model != "" {
@@ -2411,6 +2430,217 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 
 	m.hook.OnResult(ctx, result)
+}
+
+type recoveredQuotaModel struct {
+	authID string
+	model  string
+}
+
+func (m *Manager) recoverExpiredQuotaStates(ctx context.Context, providers []string, model string) {
+	if m == nil {
+		return
+	}
+	providerSet := make(map[string]struct{}, len(providers))
+	for _, provider := range normalizeProviderKeys(providers) {
+		providerSet[provider] = struct{}{}
+	}
+	modelKey := canonicalModelKey(model)
+	now := time.Now()
+	snapshots := make([]*Auth, 0)
+	recoveredModels := make([]recoveredQuotaModel, 0)
+
+	m.mu.Lock()
+	for _, auth := range m.auths {
+		if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
+			continue
+		}
+		providerKey := strings.ToLower(strings.TrimSpace(auth.Provider))
+		if len(providerSet) > 0 {
+			if _, ok := providerSet[providerKey]; !ok {
+				continue
+			}
+		}
+
+		changed := false
+		if modelKey != "" {
+			for stateModel, state := range auth.ModelStates {
+				if state == nil || !modelKeysMatch(stateModel, modelKey) {
+					continue
+				}
+				if state.Status == StatusDisabled {
+					continue
+				}
+				if !modelQuotaRecoveryDue(state, now) {
+					continue
+				}
+				resetModelState(state, now)
+				recoveredModels = append(recoveredModels, recoveredQuotaModel{authID: auth.ID, model: stateModel})
+				changed = true
+			}
+		} else if authQuotaRecoveryDue(auth, now) {
+			clearAuthStateOnSuccess(auth, now)
+			changed = true
+		}
+
+		if !changed {
+			continue
+		}
+		updateAggregatedAvailability(auth, now)
+		if !hasModelError(auth, now) {
+			auth.LastError = nil
+			auth.StatusMessage = ""
+			auth.Status = StatusActive
+		}
+		auth.UpdatedAt = now
+		if errPersist := m.persist(ctx, auth); errPersist != nil {
+			logEntryWithRequestID(ctx).WithField("auth_id", auth.ID).Warnf("failed to persist recovered quota state: %v", errPersist)
+		}
+		if m.scheduler != nil {
+			snapshots = append(snapshots, auth.Clone())
+		}
+	}
+	m.mu.Unlock()
+
+	for _, snapshot := range snapshots {
+		m.scheduler.upsertAuth(snapshot)
+	}
+	reg := registry.GetGlobalRegistry()
+	for _, recovered := range recoveredModels {
+		reg.ClearModelQuotaExceeded(recovered.authID, recovered.model)
+		reg.ResumeClientModel(recovered.authID, recovered.model)
+	}
+}
+
+func modelKeysMatch(stateModel, modelKey string) bool {
+	stateKey := canonicalModelKey(stateModel)
+	if stateKey == "" {
+		stateKey = strings.TrimSpace(stateModel)
+	}
+	return stateKey == modelKey
+}
+
+func modelQuotaRecoveryDue(state *ModelState, now time.Time) bool {
+	if state == nil || !state.Quota.Exceeded {
+		return false
+	}
+	return quotaRecoveryDue(state.NextRetryAfter, state.Quota.NextRecoverAt, now)
+}
+
+func authQuotaRecoveryDue(auth *Auth, now time.Time) bool {
+	if auth == nil || !auth.Quota.Exceeded {
+		return false
+	}
+	return quotaRecoveryDue(auth.NextRetryAfter, auth.Quota.NextRecoverAt, now)
+}
+
+func quotaRecoveryDue(nextRetryAt, nextRecoverAt, now time.Time) bool {
+	recoverAt := nextRecoverAt
+	if recoverAt.IsZero() || (!nextRetryAt.IsZero() && nextRetryAt.After(recoverAt)) {
+		recoverAt = nextRetryAt
+	}
+	if recoverAt.IsZero() {
+		return false
+	}
+	return !recoverAt.After(now)
+}
+
+func autoQuotaRecoveryAt(auth *Auth) (time.Time, bool) {
+	if auth == nil {
+		return time.Time{}, false
+	}
+	if strings.ToLower(strings.TrimSpace(auth.Provider)) != "codex" {
+		return time.Time{}, false
+	}
+	if !auth.Disabled && auth.Status != StatusDisabled {
+		return time.Time{}, false
+	}
+	if !auth.Quota.Exceeded || auth.Quota.Reason != quotaAutoDisabledReason {
+		return time.Time{}, false
+	}
+	recoverAt := auth.Quota.NextRecoverAt
+	if recoverAt.IsZero() || (!auth.NextRetryAfter.IsZero() && auth.NextRetryAfter.After(recoverAt)) {
+		recoverAt = auth.NextRetryAfter
+	}
+	if recoverAt.IsZero() {
+		return time.Time{}, false
+	}
+	return recoverAt, true
+}
+
+// ClearAutoQuotaDisabledState removes the marker used by automatic Codex quota
+// disablement so a later recovery pass cannot re-enable an operator-disabled auth.
+func ClearAutoQuotaDisabledState(auth *Auth) {
+	if auth == nil {
+		return
+	}
+	if auth.Quota.Reason == quotaAutoDisabledReason {
+		auth.Quota = QuotaState{}
+		auth.NextRetryAfter = time.Time{}
+	}
+	for _, state := range auth.ModelStates {
+		if state == nil || state.Quota.Reason != quotaAutoDisabledReason {
+			continue
+		}
+		state.Quota = QuotaState{}
+		state.NextRetryAfter = time.Time{}
+		state.Unavailable = false
+		if state.Status == StatusDisabled && state.StatusMessage == "disabled after quota exhausted" {
+			state.Status = StatusActive
+			state.StatusMessage = ""
+			state.LastError = nil
+		}
+	}
+}
+
+func (m *Manager) recoverAutoDisabledQuotaAuth(ctx context.Context, authID string, expectedRecoverAt time.Time) {
+	if m == nil || authID == "" || expectedRecoverAt.IsZero() {
+		return
+	}
+	now := time.Now()
+	var snapshot *Auth
+	recoveredModels := make([]string, 0)
+
+	m.mu.Lock()
+	auth := m.auths[authID]
+	currentRecoverAt, ok := autoQuotaRecoveryAt(auth)
+	if !ok || !currentRecoverAt.Equal(expectedRecoverAt) || currentRecoverAt.After(now) {
+		m.mu.Unlock()
+		return
+	}
+
+	auth.Disabled = false
+	clearAuthStateOnSuccess(auth, now)
+	for model, state := range auth.ModelStates {
+		if state == nil || state.Quota.Reason != quotaAutoDisabledReason {
+			continue
+		}
+		resetModelState(state, now)
+		recoveredModels = append(recoveredModels, model)
+	}
+	updateAggregatedAvailability(auth, now)
+	if !hasModelError(auth, now) {
+		auth.LastError = nil
+		auth.StatusMessage = ""
+		auth.Status = StatusActive
+	}
+	auth.UpdatedAt = now
+	if errPersist := m.persist(ctx, auth); errPersist != nil {
+		logEntryWithRequestID(ctx).WithField("auth_id", auth.ID).Warnf("failed to persist recovered auto-disabled quota auth: %v", errPersist)
+	}
+	if m.scheduler != nil {
+		snapshot = auth.Clone()
+	}
+	m.mu.Unlock()
+
+	if m.scheduler != nil && snapshot != nil {
+		m.scheduler.upsertAuth(snapshot)
+	}
+	reg := registry.GetGlobalRegistry()
+	for _, model := range recoveredModels {
+		reg.ClearModelQuotaExceeded(authID, model)
+		reg.ResumeClientModel(authID, model)
+	}
 }
 
 func ensureModelState(auth *Auth, model string) *ModelState {
@@ -2468,6 +2698,7 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 	allUnavailable := true
 	earliestRetry := time.Time{}
 	quotaExceeded := false
+	quotaReason := "quota"
 	quotaRecover := time.Time{}
 	maxBackoffLevel := 0
 	hasState := false
@@ -2497,6 +2728,9 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 		}
 		if state.Quota.Exceeded {
 			quotaExceeded = true
+			if state.Quota.Reason == quotaAutoDisabledReason {
+				quotaReason = quotaAutoDisabledReason
+			}
 			if quotaRecover.IsZero() || (!state.Quota.NextRecoverAt.IsZero() && state.Quota.NextRecoverAt.Before(quotaRecover)) {
 				quotaRecover = state.Quota.NextRecoverAt
 			}
@@ -2517,7 +2751,7 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 	}
 	if quotaExceeded {
 		auth.Quota.Exceeded = true
-		auth.Quota.Reason = "quota"
+		auth.Quota.Reason = quotaReason
 		auth.Quota.NextRecoverAt = quotaRecover
 		auth.Quota.BackoffLevel = maxBackoffLevel
 	} else {
@@ -2763,12 +2997,12 @@ func isRequestInvalidError(err error) bool {
 	}
 }
 
-func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Duration, now time.Time) {
+func applyAuthFailureState(auth *Auth, provider string, resultErr *Error, retryAfter *time.Duration, now time.Time) (time.Time, bool) {
 	if auth == nil {
-		return
+		return time.Time{}, false
 	}
 	if isRequestScopedNotFoundResultError(resultErr) {
-		return
+		return time.Time{}, false
 	}
 	disableCooling := quotaCooldownDisabledForAuth(auth)
 	auth.Unavailable = true
@@ -2781,6 +3015,9 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		}
 	}
 	statusCode := statusCodeFromResult(resultErr)
+	if shouldDisableAuthForNoQuota429(provider, auth, resultErr) {
+		return markAuthAutoDisabledForQuota(auth, nil, retryAfter, now), true
+	}
 	switch statusCode {
 	case 401:
 		auth.StatusMessage = "unauthorized"
@@ -2833,6 +3070,76 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 			auth.StatusMessage = "request failed"
 		}
 	}
+	return time.Time{}, false
+}
+
+func markAuthAutoDisabledForQuota(auth *Auth, state *ModelState, retryAfter *time.Duration, now time.Time) time.Time {
+	if auth == nil {
+		return time.Time{}
+	}
+	backoffLevel := auth.Quota.BackoffLevel
+	if state != nil && state.Quota.BackoffLevel > backoffLevel {
+		backoffLevel = state.Quota.BackoffLevel
+	}
+
+	var recoverAt time.Time
+	if retryAfter != nil && *retryAfter > 0 {
+		recoverAt = now.Add(*retryAfter)
+	} else {
+		cooldown, nextLevel := nextQuotaCooldown(backoffLevel, false)
+		if cooldown > 0 {
+			recoverAt = now.Add(cooldown)
+		}
+		backoffLevel = nextLevel
+	}
+
+	auth.Disabled = true
+	auth.Unavailable = true
+	auth.Status = StatusDisabled
+	auth.StatusMessage = "disabled after quota exhausted"
+	auth.NextRetryAfter = recoverAt
+	auth.Quota = QuotaState{
+		Exceeded:      true,
+		Reason:        quotaAutoDisabledReason,
+		NextRecoverAt: recoverAt,
+		BackoffLevel:  backoffLevel,
+	}
+	if state != nil {
+		state.Unavailable = true
+		state.Status = StatusDisabled
+		state.StatusMessage = auth.StatusMessage
+		state.NextRetryAfter = recoverAt
+		state.Quota = QuotaState{
+			Exceeded:      true,
+			Reason:        quotaAutoDisabledReason,
+			NextRecoverAt: recoverAt,
+			BackoffLevel:  backoffLevel,
+		}
+		state.UpdatedAt = now
+	}
+	return recoverAt
+}
+
+func shouldDisableAuthForNoQuota429(provider string, auth *Auth, resultErr *Error) bool {
+	if statusCodeFromResult(resultErr) != http.StatusTooManyRequests || resultErr == nil {
+		return false
+	}
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider == "" && auth != nil {
+		provider = strings.ToLower(strings.TrimSpace(auth.Provider))
+	}
+	if provider != "codex" {
+		return false
+	}
+	message := strings.ToLower(strings.TrimSpace(resultErr.Message))
+	if message == "" {
+		return false
+	}
+	return strings.Contains(message, "usage_limit_reached") ||
+		strings.Contains(message, "insufficient_quota") ||
+		strings.Contains(message, "quota exhausted") ||
+		strings.Contains(message, "no quota") ||
+		strings.Contains(message, "out of quota")
 }
 
 // nextQuotaCooldown returns the next cooldown duration and updated backoff level for repeated quota errors.
@@ -3052,6 +3359,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 }
 
 func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
+	m.recoverExpiredQuotaStates(ctx, []string{provider}, model)
 	if m.HomeEnabled() {
 		auth, exec, _, err := m.pickNextViaHome(ctx, model, opts, tried)
 		return auth, exec, err
@@ -3210,6 +3518,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 }
 
 func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
+	m.recoverExpiredQuotaStates(ctx, providers, model)
 	if m.HomeEnabled() {
 		return m.pickNextViaHome(ctx, model, opts, tried)
 	}
@@ -3860,6 +4169,7 @@ func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duratio
 	cancelPrev := m.refreshCancel
 	m.refreshCancel = nil
 	m.refreshLoop = nil
+	m.quotaRecoveryLoop = nil
 	m.mu.Unlock()
 	if cancelPrev != nil {
 		cancelPrev()
@@ -3871,14 +4181,18 @@ func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duratio
 		workers = cfg.AuthAutoRefreshWorkers
 	}
 	loop := newAuthAutoRefreshLoop(m, interval, workers)
+	quotaLoop := newQuotaRecoveryLoop(m, quotaRecoveryCheckInterval)
 
 	m.mu.Lock()
 	m.refreshCancel = cancelCtx
 	m.refreshLoop = loop
+	m.quotaRecoveryLoop = quotaLoop
 	m.mu.Unlock()
 
 	loop.rebuild(time.Now())
+	quotaLoop.rebuild()
 	go loop.run(ctx)
+	go quotaLoop.run(ctx)
 }
 
 // StopAutoRefresh cancels the background refresh loop, if running.
@@ -3888,6 +4202,7 @@ func (m *Manager) StopAutoRefresh() {
 	cancel := m.refreshCancel
 	m.refreshCancel = nil
 	m.refreshLoop = nil
+	m.quotaRecoveryLoop = nil
 	m.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -3909,6 +4224,45 @@ func (m *Manager) queueRefreshReschedule(authID string) {
 		return
 	}
 	loop.queueReschedule(authID)
+}
+
+func (m *Manager) queueQuotaRecovery(authID string, recoverAt time.Time) {
+	if m == nil || authID == "" || recoverAt.IsZero() {
+		return
+	}
+	m.mu.RLock()
+	loop := m.quotaRecoveryLoop
+	m.mu.RUnlock()
+	if loop == nil {
+		return
+	}
+	loop.upsert(authID, recoverAt)
+}
+
+func (m *Manager) queueQuotaRecoveryFromAuth(authID string) {
+	if m == nil || authID == "" {
+		return
+	}
+	m.mu.RLock()
+	loop := m.quotaRecoveryLoop
+	m.mu.RUnlock()
+	if loop == nil {
+		return
+	}
+	loop.rescheduleFromAuth(authID)
+}
+
+func (m *Manager) rebuildQuotaRecoveryQueue() {
+	if m == nil {
+		return
+	}
+	m.mu.RLock()
+	loop := m.quotaRecoveryLoop
+	m.mu.RUnlock()
+	if loop == nil {
+		return
+	}
+	loop.rebuild()
 }
 
 func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
