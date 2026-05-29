@@ -353,8 +353,9 @@ func (m configTabModel) parseConfig(cfg map[string]any) []configField {
 		fields = append(fields, configField{"Routing Strategy", "routing/strategy", "string", "", nil})
 	}
 
-	// WebSocket auth
+	// WebSocket settings
 	fields = append(fields, configField{"WebSocket Auth", "ws-auth", "bool", fmt.Sprintf("%v", getBool(cfg, "ws-auth")), nil})
+	fields = append(fields, configField{"Codex Force WebSockets", "codex-force-websockets", "bool", fmt.Sprintf("%v", getBool(cfg, "codex-force-websockets")), nil})
 
 	// AMP settings
 	if amp, ok := cfg["ampcode"].(map[string]any); ok {
@@ -383,7 +384,7 @@ func fieldSection(apiPath string) string {
 		return T("section_server")
 	case "logging-to-file", "logs-max-total-size-mb", "error-logs-max-files", "usage-statistics-enabled", "request-log":
 		return T("section_logging")
-	case "ws-auth":
+	case "ws-auth", "codex-force-websockets":
 		return T("section_websocket")
 	default:
 		return T("section_other")
