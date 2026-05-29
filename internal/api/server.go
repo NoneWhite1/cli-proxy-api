@@ -619,6 +619,9 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/ws-auth", s.mgmt.GetWebsocketAuth)
 		mgmt.PUT("/ws-auth", s.mgmt.PutWebsocketAuth)
 		mgmt.PATCH("/ws-auth", s.mgmt.PutWebsocketAuth)
+		mgmt.GET("/codex-force-websockets", s.mgmt.GetCodexForceWebsockets)
+		mgmt.PUT("/codex-force-websockets", s.mgmt.PutCodexForceWebsockets)
+		mgmt.PATCH("/codex-force-websockets", s.mgmt.PutCodexForceWebsockets)
 
 		mgmt.GET("/ampcode", s.mgmt.GetAmpCode)
 		mgmt.GET("/ampcode/upstream-url", s.mgmt.GetAmpUpstreamURL)
