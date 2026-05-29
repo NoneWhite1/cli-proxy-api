@@ -14,7 +14,9 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/geminicli"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
@@ -54,6 +56,66 @@ type apiCallResponse struct {
 	StatusCode int                 `json:"status_code"`
 	Header     map[string][]string `json:"header"`
 	Body       string              `json:"body"`
+}
+
+type codexPreheatRequest struct {
+	AuthIndexSnake  *string `json:"auth_index"`
+	AuthIndexCamel  *string `json:"authIndex"`
+	AuthIndexPascal *string `json:"AuthIndex"`
+}
+
+func (h *Handler) PreheatCodexAuthFile(c *gin.Context) {
+	var body codexPreheatRequest
+	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+
+	authIndex := firstNonEmptyString(body.AuthIndexSnake, body.AuthIndexCamel, body.AuthIndexPascal)
+	if authIndex == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing auth_index"})
+		return
+	}
+	if h == nil || h.authManager == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "auth manager unavailable"})
+		return
+	}
+	auth := h.authByIndex(authIndex)
+	if auth == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "auth not found"})
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "auth is not codex"})
+		return
+	}
+
+	const model = "gpt-5.5"
+	payload := []byte(`{"model":"` + model + `","messages":[{"role":"user","content":"1"}],"stream":false}`)
+	_, errExecute := h.authManager.Execute(c.Request.Context(), []string{"codex"}, cliproxyexecutor.Request{
+		Model:   model,
+		Payload: payload,
+		Format:  sdktranslator.FormatOpenAI,
+	}, cliproxyexecutor.Options{
+		Stream:          false,
+		SourceFormat:    sdktranslator.FormatOpenAI,
+		OriginalRequest: payload,
+		Metadata: map[string]any{
+			cliproxyexecutor.PinnedAuthMetadataKey: auth.ID,
+		},
+	})
+	if errExecute != nil {
+		statusCode := http.StatusBadGateway
+		if statusErr, ok := errExecute.(cliproxyexecutor.StatusError); ok && statusErr != nil {
+			if code := statusErr.StatusCode(); code >= http.StatusBadRequest && code < http.StatusInternalServerError {
+				statusCode = code
+			}
+		}
+		c.JSON(statusCode, gin.H{"error": "preheat failed", "message": errExecute.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"ok": true, "auth_index": authIndex, "auth_id": auth.ID, "model": model})
 }
 
 // APICall makes a generic HTTP request on behalf of the management API caller.

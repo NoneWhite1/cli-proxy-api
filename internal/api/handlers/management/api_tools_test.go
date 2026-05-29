@@ -2,13 +2,150 @@ package management
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 )
+
+type preheatTestCall struct {
+	authID  string
+	model   string
+	payload []byte
+	opts    cliproxyexecutor.Options
+}
+
+type preheatTestExecutor struct {
+	calls []preheatTestCall
+}
+
+func (e *preheatTestExecutor) Identifier() string { return "codex" }
+
+func (e *preheatTestExecutor) Execute(_ context.Context, auth *coreauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	authID := ""
+	if auth != nil {
+		authID = auth.ID
+	}
+	e.calls = append(e.calls, preheatTestCall{authID: authID, model: req.Model, payload: req.Payload, opts: opts})
+	return cliproxyexecutor.Response{Payload: []byte(`{"id":"preheat-ok"}`)}, nil
+}
+
+func (e *preheatTestExecutor) ExecuteStream(context.Context, *coreauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	return nil, nil
+}
+
+func (e *preheatTestExecutor) Refresh(_ context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	return auth, nil
+}
+
+func (e *preheatTestExecutor) CountTokens(context.Context, *coreauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+
+func (e *preheatTestExecutor) HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
+}
+
+func TestPreheatCodexAuthFilePinsSelectedCodexAuth(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	exec := &preheatTestExecutor{}
+	manager.RegisterExecutor(exec)
+
+	first := &coreauth.Auth{ID: "codex-first", Provider: "codex"}
+	second := &coreauth.Auth{ID: "codex-second", Provider: "codex"}
+	if _, errRegister := manager.Register(context.Background(), first); errRegister != nil {
+		t.Fatalf("register first codex auth: %v", errRegister)
+	}
+	if _, errRegister := manager.Register(context.Background(), second); errRegister != nil {
+		t.Fatalf("register second codex auth: %v", errRegister)
+	}
+	modelRegistry := registry.GetGlobalRegistry()
+	modelRegistry.RegisterClient(first.ID, first.Provider, []*registry.ModelInfo{{ID: "gpt-5.5"}})
+	modelRegistry.RegisterClient(second.ID, second.Provider, []*registry.ModelInfo{{ID: "gpt-5.5"}})
+	t.Cleanup(func() {
+		modelRegistry.UnregisterClient(first.ID)
+		modelRegistry.UnregisterClient(second.ID)
+	})
+
+	h := &Handler{authManager: manager}
+	body := `{"auth_index":"` + second.EnsureIndex() + `"}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/auth-files/preheat", strings.NewReader(body))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	h.PreheatCodexAuthFile(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if len(exec.calls) != 1 {
+		t.Fatalf("executor calls = %d, want 1", len(exec.calls))
+	}
+	call := exec.calls[0]
+	if call.authID != second.ID {
+		t.Fatalf("selected auth ID = %q, want %q", call.authID, second.ID)
+	}
+	if call.model != "gpt-5.5" {
+		t.Fatalf("model = %q, want gpt-5.5", call.model)
+	}
+	if call.opts.Stream {
+		t.Fatal("preheat should use a non-stream request")
+	}
+	if call.opts.SourceFormat != sdktranslator.FormatOpenAI {
+		t.Fatalf("source format = %s, want openai", call.opts.SourceFormat)
+	}
+	if got := call.opts.Metadata[cliproxyexecutor.PinnedAuthMetadataKey]; got != second.ID {
+		t.Fatalf("pinned auth metadata = %#v, want %q", got, second.ID)
+	}
+	if !strings.Contains(string(call.payload), `"content":"1"`) {
+		t.Fatalf("payload did not contain shortest preheat message: %s", string(call.payload))
+	}
+
+	var resp map[string]any
+	if errUnmarshal := json.Unmarshal(rec.Body.Bytes(), &resp); errUnmarshal != nil {
+		t.Fatalf("decode response: %v", errUnmarshal)
+	}
+	if resp["ok"] != true {
+		t.Fatalf("ok = %#v, want true", resp["ok"])
+	}
+}
+
+func TestPreheatCodexAuthFileRejectsNonCodexAuth(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	auth := &coreauth.Auth{ID: "gemini-auth", Provider: "gemini"}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register gemini auth: %v", errRegister)
+	}
+
+	h := &Handler{authManager: manager}
+	body := `{"auth_index":"` + auth.EnsureIndex() + `"}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/auth-files/preheat", strings.NewReader(body))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	h.PreheatCodexAuthFile(ctx)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+}
 
 func TestAPICallTransportDirectBypassesGlobalProxy(t *testing.T) {
 	t.Parallel()
