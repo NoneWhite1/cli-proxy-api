@@ -759,7 +759,14 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 		}
 	}
 
-	c.File(filePath)
+	data, errReadFile := os.ReadFile(filePath)
+	if errReadFile != nil {
+		log.WithError(errReadFile).Error("failed to read management control panel asset")
+		c.AbortWithStatus(http.StatusInternalServerError)
+		return
+	}
+
+	c.Data(http.StatusOK, "text/html; charset=utf-8", injectManagementPreheatPanel(data))
 }
 
 func (s *Server) enableKeepAlive(timeout time.Duration, onTimeout func()) {

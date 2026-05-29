@@ -174,6 +174,174 @@ func TestHomeEnabledHidesManagementEndpointsAndControlPanel(t *testing.T) {
 	})
 }
 
+func TestInjectManagementPreheatPanelAddsScript(t *testing.T) {
+	input := []byte(`<!doctype html><html><body><div id="root"></div></body></html>`)
+	out := injectManagementPreheatPanel(input)
+	body := string(out)
+
+	if !strings.Contains(body, `window.__cliproxyCodexPreheat`) {
+		t.Fatalf("injected html missing preheat marker: %s", body)
+	}
+	if !strings.Contains(body, `/v0/management/auth-files/preheat`) {
+		t.Fatalf("injected html missing preheat endpoint: %s", body)
+	}
+	if strings.Index(body, `window.__cliproxyCodexPreheat`) > strings.Index(body, `</body>`) {
+		t.Fatalf("preheat script should be inserted before </body>: %s", body)
+	}
+}
+
+func TestInjectManagementPreheatPanelSkipsExistingScript(t *testing.T) {
+	input := []byte(`<!doctype html><html><body>` + managementPreheatScript + `</body></html>`)
+	out := injectManagementPreheatPanel(input)
+
+	if string(out) != string(input) {
+		t.Fatalf("expected current preheat script to remain unchanged")
+	}
+}
+
+func TestInjectManagementPreheatPanelReplacesStaleScript(t *testing.T) {
+	input := []byte(`<!doctype html><html><body><main></main><script>window.__cliproxyCodexPreheat=true;function parseAuthFiles(){return [];}</script></body></html>`)
+	out := injectManagementPreheatPanel(input)
+	body := string(out)
+
+	if strings.Contains(body, `function parseAuthFiles(){return [];}`) {
+		t.Fatalf("stale preheat script was not replaced: %s", body)
+	}
+	if !strings.Contains(body, `function refreshAuthFilesSoon`) {
+		t.Fatalf("replacement script missing refresh behavior: %s", body)
+	}
+	if strings.Count(body, `window.__cliproxyCodexPreheat`) != 2 {
+		t.Fatalf("preheat marker count = %d, want 2 in one current script: %s", strings.Count(body, `window.__cliproxyCodexPreheat`), body)
+	}
+}
+
+func TestManagementControlPanelReplacesStalePreheatScriptFromStaticPath(t *testing.T) {
+	staticPath := filepath.Join(t.TempDir(), "management.html")
+	t.Setenv("MANAGEMENT_STATIC_PATH", staticPath)
+
+	staleScript := `function parseAuthFiles(){return [];}`
+	staleHTML := `<!doctype html><html><body><main></main><script>window.__cliproxyCodexPreheat=true;` + staleScript + `</script></body></html>`
+	if err := os.WriteFile(staticPath, []byte(staleHTML), 0o644); err != nil {
+		t.Fatalf("failed to write stale management asset: %v", err)
+	}
+
+	server := newTestServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/management.html", nil)
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if strings.Contains(body, staleScript) {
+		t.Fatalf("served management panel kept stale preheat script: %s", body)
+	}
+	if !strings.Contains(body, `function refreshAuthFilesSoon`) {
+		t.Fatalf("served management panel missing refreshed preheat script: %s", body)
+	}
+	if strings.Count(body, `window.__cliproxyCodexPreheat`) != 2 {
+		t.Fatalf("served preheat marker count = %d, want 2 in one current script: %s", strings.Count(body, `window.__cliproxyCodexPreheat`), body)
+	}
+}
+
+func TestManagementPreheatPanelRefreshesAfterAuthFileMutation(t *testing.T) {
+	script := managementPreheatScript
+	if !strings.Contains(script, `function refreshAuthFilesSoon`) {
+		t.Fatalf("preheat script should debounce auth-files refreshes after imports")
+	}
+	if !strings.Contains(script, `method !== "GET"`) {
+		t.Fatalf("preheat script should detect non-GET auth-files mutations")
+	}
+	if !strings.Contains(script, `path.indexOf(authFilesEndpoint) === 0`) {
+		t.Fatalf("preheat script should refresh after auth-files subtree mutations")
+	}
+	if !strings.Contains(script, `refreshAuthFilesSoon(250)`) {
+		t.Fatalf("preheat script should schedule a refresh after successful auth file mutations")
+	}
+}
+
+func TestManagementPreheatPanelUsesAuthFilesSelection(t *testing.T) {
+	script := managementPreheatScript
+	if strings.Contains(script, `<select aria-label="选择 Codex 凭证"`) {
+		t.Fatalf("preheat script should not render a separate credential dropdown")
+	}
+	if !strings.Contains(script, `function selectedCodexAuthFiles`) {
+		t.Fatalf("preheat script should collect selected Codex rows from the auth-files page")
+	}
+	if !strings.Contains(script, `querySelectorAll("input[type='checkbox']:checked")`) {
+		t.Fatalf("preheat script should use existing checked auth-files page rows")
+	}
+	if !strings.Contains(script, `Promise.all(selected.map(preheatAuthFile))`) {
+		t.Fatalf("preheat script should preheat every selected credential")
+	}
+	if !strings.Contains(script, `预热选中账号`) {
+		t.Fatalf("preheat script should add a preheat-selected action on the auth-files page")
+	}
+}
+
+func TestManagementPreheatPanelWalksSelectionAncestors(t *testing.T) {
+	script := managementPreheatScript
+	if !strings.Contains(script, `function fileForCheckbox`) {
+		t.Fatalf("preheat script should resolve selected files from nested auth-files checkbox ancestors")
+	}
+	if !strings.Contains(script, `while (node && node !== document.body)`) {
+		t.Fatalf("preheat script should walk ancestors until it finds the credential card text")
+	}
+}
+
+func TestManagementPreheatPanelIgnoresNonSelectionCheckboxes(t *testing.T) {
+	script := managementPreheatScript
+	if !strings.Contains(script, `function isSelectionCheckbox`) {
+		t.Fatalf("preheat script should distinguish row selection checkboxes from status toggles")
+	}
+	if !strings.Contains(script, `SelectionCheckbox`) {
+		t.Fatalf("preheat script should target the auth-files selection checkbox class")
+	}
+	if !strings.Contains(script, `cardSelection`) {
+		t.Fatalf("preheat script should target auth-files card selection wrappers")
+	}
+}
+
+func TestManagementPreheatPanelDoesNotLoadAuthFilesBeforeAuthFilesPage(t *testing.T) {
+	script := managementPreheatScript
+	if strings.Contains(script, `loadAuthFiles();`) {
+		t.Fatalf("preheat script should not issue standalone auth-files requests before the management UI is authenticated")
+	}
+	if !strings.Contains(script, `path === "/auth-files"`) {
+		t.Fatalf("preheat script should only render its action on the auth-files page")
+	}
+}
+
+func TestManagementPreheatPanelTracksAuthFilesXHR(t *testing.T) {
+	script := managementPreheatScript
+	if !strings.Contains(script, `XMLHttpRequest.prototype.open`) {
+		t.Fatalf("preheat script should observe management UI XHR auth-files requests")
+	}
+	if !strings.Contains(script, `XMLHttpRequest.prototype.send`) {
+		t.Fatalf("preheat script should hook XHR send for auth-files responses")
+	}
+	if !strings.Contains(script, `xhr.addEventListener("load"`) {
+		t.Fatalf("preheat script should parse successful XHR auth-files responses")
+	}
+	if !strings.Contains(script, `JSON.parse(xhr.responseText || "{}")`) {
+		t.Fatalf("preheat script should parse XHR auth-files JSON payloads")
+	}
+}
+
+func TestManagementPreheatPanelReusesObservedManagementAuth(t *testing.T) {
+	script := managementPreheatScript
+	if !strings.Contains(script, `state.authHeaders`) {
+		t.Fatalf("preheat script should store management auth headers observed from the app")
+	}
+	if !strings.Contains(script, `XMLHttpRequest.prototype.setRequestHeader`) {
+		t.Fatalf("preheat script should observe XHR Authorization headers")
+	}
+	if !strings.Contains(script, `headers.Authorization`) {
+		t.Fatalf("preheat script should reuse observed Authorization for preheat requests")
+	}
+}
+
 func TestAmpProviderModelRoutes(t *testing.T) {
 	testCases := []struct {
 		name         string
