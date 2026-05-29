@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/translator"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
@@ -554,5 +555,182 @@ func TestNewProxyAwareWebsocketDialerDirectDisablesProxy(t *testing.T) {
 
 	if dialer.Proxy != nil {
 		t.Fatal("expected websocket proxy function to be nil for direct mode")
+	}
+}
+
+func TestCodexAutoExecutorForceWebsocketsUsesUpstreamWebsocketForHTTPDownstream(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	capturedPayload := make(chan []byte, 1)
+	httpAttempt := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if websocket.IsWebSocketUpgrade(r) {
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				t.Fatalf("upgrade websocket: %v", err)
+			}
+			defer func() { _ = conn.Close() }()
+
+			msgType, payload, err := conn.ReadMessage()
+			if err != nil {
+				t.Fatalf("read upstream websocket message: %v", err)
+			}
+			if msgType != websocket.TextMessage {
+				t.Fatalf("message type = %d, want text", msgType)
+			}
+			capturedPayload <- bytes.Clone(payload)
+
+			completed := []byte(`{"type":"response.completed","response":{"id":"resp-ws","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`)
+			if errWrite := conn.WriteMessage(websocket.TextMessage, completed); errWrite != nil {
+				t.Fatalf("write completed websocket message: %v", errWrite)
+			}
+			return
+		}
+
+		select {
+		case httpAttempt <- struct{}{}:
+		default:
+		}
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	defer server.Close()
+
+	exec := NewCodexAutoExecutor(&config.Config{SDKConfig: config.SDKConfig{
+		CodexForceWebsockets:   true,
+		DisableImageGeneration: config.DisableImageGenerationAll,
+	}})
+	auth := &cliproxyauth.Auth{Provider: "codex", Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5-codex",
+		Payload: []byte(`{"model":"gpt-5-codex","input":[]}`),
+	}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("codex")}
+
+	if _, err := exec.Execute(context.Background(), auth, req, opts); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	select {
+	case payload := <-capturedPayload:
+		if got := gjson.GetBytes(payload, "type").String(); got != "response.create" {
+			t.Fatalf("upstream websocket type = %s, want response.create; payload=%s", got, payload)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for upstream websocket payload")
+	}
+
+	select {
+	case <-httpAttempt:
+		t.Fatal("unexpected HTTP upstream request when codex-force-websockets=true")
+	default:
+	}
+}
+
+func TestCodexAutoExecutorHTTPDownstreamUsesHTTPWhenForceWebsocketsDisabled(t *testing.T) {
+	wsAttempt := make(chan struct{}, 1)
+	httpAttempt := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if websocket.IsWebSocketUpgrade(r) {
+			select {
+			case wsAttempt <- struct{}{}:
+			default:
+			}
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		httpAttempt <- r.URL.Path
+		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp-http","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	exec := NewCodexAutoExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{Provider: "codex", Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5-codex",
+		Payload: []byte(`{"model":"gpt-5-codex","input":[]}`),
+	}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("codex")}
+
+	if _, err := exec.Execute(context.Background(), auth, req, opts); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	select {
+	case path := <-httpAttempt:
+		if path != "/responses" {
+			t.Fatalf("upstream HTTP path = %s, want /responses", path)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for upstream HTTP request")
+	}
+
+	select {
+	case <-wsAttempt:
+		t.Fatal("unexpected websocket upstream request when codex-force-websockets=false")
+	default:
+	}
+}
+
+func TestCodexAutoExecutorForceWebsocketsPreservesOutputItemDoneForHTTPDownstream(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !websocket.IsWebSocketUpgrade(r) {
+			w.WriteHeader(http.StatusTeapot)
+			return
+		}
+
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Fatalf("upgrade websocket: %v", err)
+		}
+		defer func() { _ = conn.Close() }()
+
+		if _, _, errRead := conn.ReadMessage(); errRead != nil {
+			t.Fatalf("read upstream websocket message: %v", errRead)
+		}
+		outputDone := []byte(`{"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]},"output_index":0}`)
+		if errWrite := conn.WriteMessage(websocket.TextMessage, outputDone); errWrite != nil {
+			t.Fatalf("write output item websocket message: %v", errWrite)
+		}
+		completed := []byte(`{"type":"response.completed","response":{"id":"resp-ws","object":"response","created_at":1775555723,"status":"completed","model":"gpt-5-codex","output":[],"usage":{"input_tokens":8,"output_tokens":28,"total_tokens":36}}}`)
+		if errWrite := conn.WriteMessage(websocket.TextMessage, completed); errWrite != nil {
+			t.Fatalf("write completed websocket message: %v", errWrite)
+		}
+	}))
+	defer server.Close()
+
+	exec := NewCodexAutoExecutor(&config.Config{SDKConfig: config.SDKConfig{
+		CodexForceWebsockets:   true,
+		DisableImageGeneration: config.DisableImageGenerationAll,
+	}})
+	auth := &cliproxyauth.Auth{Provider: "codex", Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5-codex",
+		Payload: []byte(`{"model":"gpt-5-codex","messages":[{"role":"user","content":"Say ok"}]}`),
+	}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai")}
+
+	resp, err := exec.Execute(context.Background(), auth, req, opts)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := gjson.GetBytes(resp.Payload, "choices.0.message.content").String(); got != "ok" {
+		t.Fatalf("choices.0.message.content = %q, want ok; payload=%s", got, resp.Payload)
+	}
+}
+
+func TestCodexAutoExecutorForceWebsocketsKeepsCompactAndImagesOnHTTP(t *testing.T) {
+	exec := NewCodexAutoExecutor(&config.Config{SDKConfig: config.SDKConfig{CodexForceWebsockets: true}})
+	auth := &cliproxyauth.Auth{Provider: "codex", Attributes: map[string]string{"api_key": "sk-test"}}
+
+	if exec.useWebsocketTransport(context.Background(), auth, cliproxyexecutor.Options{Alt: "responses/compact"}) {
+		t.Fatal("responses/compact should stay on HTTP when codex-force-websockets=true")
+	}
+	imageOpts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-image"),
+		Metadata:     map[string]any{cliproxyexecutor.RequestPathMetadataKey: "/v1/images/generations"},
+	}
+	if exec.useWebsocketTransport(context.Background(), auth, imageOpts) {
+		t.Fatal("OpenAI image endpoint should stay on HTTP when codex-force-websockets=true")
 	}
 }
