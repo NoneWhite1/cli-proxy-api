@@ -129,6 +129,10 @@ routing:
 # When true, enable authentication for the WebSocket API (/v1/ws).
 ws-auth: true
 
+# When true, CPA keeps accepting client/new-api requests over HTTP but uses
+# the Codex Responses API websocket transport for outbound CPA -> Codex requests.
+codex-force-websockets: false
+
 # When true, enable Gemini CLI internal endpoints (/v1internal:*).
 # Default is false for safety.
 enable-gemini-cli-endpoint: false

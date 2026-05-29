@@ -9,6 +9,10 @@ type SDKConfig struct {
 	// ProxyURL is the URL of an optional proxy server to use for outbound requests.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
 
+	// CodexForceWebsockets forces Codex Responses requests received over HTTP to use
+	// the upstream Responses API websocket transport. It does not change inbound HTTP APIs.
+	CodexForceWebsockets bool `yaml:"codex-force-websockets" json:"codex-force-websockets"`
+
 	// DisableImageGeneration controls whether the built-in image_generation tool is injected/allowed.
 	//
 	// Supported values:
