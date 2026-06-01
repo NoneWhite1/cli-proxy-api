@@ -2,6 +2,8 @@
 
 [English](README.md) | 中文 | [日本語](README_JA.md)
 
+> cpa自用二开项目：此公开仓库为个人自用的 CPA 二次开发版本。
+
 一个为 CLI 提供 OpenAI/Gemini/Claude/Codex/Grok 兼容 API 接口的代理服务器。
 
 现已支持通过 OAuth 登录接入 OpenAI Codex（GPT 系列）和 Claude Code。

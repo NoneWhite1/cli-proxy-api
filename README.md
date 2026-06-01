@@ -2,6 +2,8 @@
 
 English | [中文](README_CN.md) | [日本語](README_JA.md)
 
+> CPA self-use fork: this public repository is a personal second-development build for CPA usage.
+
 A proxy server that provides OpenAI/Gemini/Claude/Codex/Grok compatible API interfaces for CLI.
 
 It now also supports OpenAI Codex (GPT models) and Claude Code via OAuth.
