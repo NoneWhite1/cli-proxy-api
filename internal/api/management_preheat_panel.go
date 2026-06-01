@@ -19,7 +19,8 @@ const managementPreheatScript = `<script>
         var originalFetch = window.fetch ? window.fetch.bind(window) : null;
         var preheatIntervalMs = 1000;
         var autoPreheatLoopIntervalMs = 60000;
-        var weeklyWindowSeconds = 604800;
+        var monthlyWindowSeconds = [2419200, 2505600, 2592000, 2678400];
+        var quotaResetWindowSeconds = monthlyWindowSeconds;
         var state = { files: [], selectedAuthFiles: {}, refreshTimes: {}, showOnlyNoRefreshTime: false, autoRunning: false, autoBusy: false, loading: false, message: "", messageType: "muted", authHeaders: {} };
         var renderTimer = null;
         var refreshTimer = null;
@@ -219,7 +220,7 @@ const managementPreheatScript = `<script>
             '<button type="button" data-preheat-action="fetch-refresh"' + manualDisabled + '>获取选中刷新时间</button>' +
             '<button type="button" data-preheat-action="toggle-missing"' + togglePressed + '>' + (state.showOnlyNoRefreshTime ? "显示全部凭证" : "只显示未获取刷新时间") + '</button>' +
             '<button type="button" data-preheat-action="auto"' + autoDisabled + '>' + (state.autoRunning ? "停止自动预热" : "启动自动预热") + '</button>' +
-            '<span class="codex-preheat-counts"><span class="codex-preheat-pill">未获取刷新时间：' + counts.missing + '</span><span class="codex-preheat-pill">已获取刷新时间：' + counts.fetched + '</span><span class="codex-preheat-pill">需要预热：' + counts.ready + '</span><span class="codex-preheat-pill">等待周限刷新：' + counts.scheduled + '</span></span>' +
+            '<span class="codex-preheat-counts"><span class="codex-preheat-pill">未获取刷新时间：' + counts.missing + '</span><span class="codex-preheat-pill">已获取刷新时间：' + counts.fetched + '</span><span class="codex-preheat-pill">需要预热：' + counts.ready + '</span><span class="codex-preheat-pill">等待限额刷新：' + counts.scheduled + '</span></span>' +
             (state.message ? '<span class="codex-preheat-message ' + escapeHtml(state.messageType) + '">' + escapeHtml(state.message) + '</span>' : "");
           panel.querySelector("[data-preheat-action='manual']").addEventListener("click", preheatSelected);
           panel.querySelector("[data-preheat-action='fetch-refresh']").addEventListener("click", fetchSelectedRefreshTimes);
@@ -596,7 +597,12 @@ const managementPreheatScript = `<script>
           return "";
         }
 
-        function weeklyWindowOf(usage) {
+        function isQuotaResetWindowSeconds(seconds) {
+          seconds = Math.round(seconds || 0);
+          return quotaResetWindowSeconds.indexOf(seconds) !== -1;
+        }
+
+        function quotaResetWindowOf(usage) {
           if (!usage || typeof usage !== "object") return null;
           var rateLimits = [usage.rate_limit || usage.rateLimit, usage.code_review_rate_limit || usage.codeReviewRateLimit];
           for (var i = 0; i < rateLimits.length; i++) {
@@ -607,18 +613,21 @@ const managementPreheatScript = `<script>
               var windowValue = windows[j];
               if (!windowValue || typeof windowValue !== "object") continue;
               var seconds = numberValue(windowValue.limit_window_seconds || windowValue.limitWindowSeconds);
-              if (Math.round(seconds || 0) === weeklyWindowSeconds) return windowValue;
+              seconds = Math.round(seconds || 0);
+              if (isQuotaResetWindowSeconds(seconds)) return { window: windowValue, seconds: seconds };
             }
           }
           return null;
         }
 
         function normalizeCodexUsageRefreshState(usage) {
-          var weeklyWindow = weeklyWindowOf(usage);
-          if (!weeklyWindow) return { fetched_refresh_time: false };
+          var quotaWindow = quotaResetWindowOf(usage);
+          if (!quotaWindow) return { fetched_refresh_time: false };
+          var quotaWindowSeconds = quotaWindow.seconds;
+          var quotaWindowValue = quotaWindow.window;
           var now = Date.now();
-          var resetAfter = numberValue(weeklyWindow.reset_after_seconds || weeklyWindow.resetAfterSeconds);
-          var resetAt = numberValue(weeklyWindow.reset_at || weeklyWindow.resetAt);
+          var resetAfter = numberValue(quotaWindowValue.reset_after_seconds || quotaWindowValue.resetAfterSeconds);
+          var resetAt = numberValue(quotaWindowValue.reset_at || quotaWindowValue.resetAt);
           var resetAtDelta = resetAt !== null && resetAt > 0 ? resetAt - Math.floor(now / 1000) : null;
           var normalized = {
             fetched_refresh_time: true,
@@ -626,7 +635,7 @@ const managementPreheatScript = `<script>
             exact_seven_day_refresh: false,
             preheat_needed: false
           };
-          if ((resetAfter !== null && Math.round(resetAfter) === weeklyWindowSeconds) || (resetAtDelta !== null && Math.round(resetAtDelta) === weeklyWindowSeconds)) {
+          if ((resetAfter !== null && Math.round(resetAfter) === quotaWindowSeconds) || (resetAtDelta !== null && Math.round(resetAtDelta) === quotaWindowSeconds)) {
             normalized.exact_seven_day_refresh = true;
             normalized.preheat_needed = true;
             return normalized;
@@ -707,7 +716,7 @@ const managementPreheatScript = `<script>
           });
         }
 
-        function exactSevenDayRefreshAuthFiles(files) {
+        function exactRefreshAuthFiles(files) {
           var candidates = Array.isArray(files) ? files : state.files;
           return candidates.filter(function (file) {
             var refresh = refreshStateFor(file);
@@ -715,7 +724,7 @@ const managementPreheatScript = `<script>
           });
         }
 
-        function sortWeeklyResetAuthFiles(files) {
+        function sortResetAuthFiles(files) {
           var candidates = Array.isArray(files) ? files : state.files;
           return candidates.filter(function (file) {
             var refresh = refreshStateFor(file);
@@ -800,18 +809,18 @@ const managementPreheatScript = `<script>
           state.autoBusy = true;
           return loadAuthFilesForPreheat().then(function (files) {
             if (!state.autoRunning) return "stop";
-            var exact = exactSevenDayRefreshAuthFiles(files);
+            var exact = exactRefreshAuthFiles(files);
             if (exact.length) {
               state.messageType = "muted";
-              state.message = "正在处理已到达 7 天刷新时间的 Codex 账号：" + exact.length + " 个";
+              state.message = "正在处理已到达限额刷新时间的 Codex 账号：" + exact.length + " 个";
               scheduleRender();
               return preheatAndRefreshWithInterval(exact).then(function () { return "continue"; });
             }
-            var scheduled = sortWeeklyResetAuthFiles(files);
+            var scheduled = sortResetAuthFiles(files);
             var next = scheduled[0];
             if (!next) {
               state.messageType = "muted";
-              state.message = "没有已获取周限刷新时间的 Codex 账号";
+              state.message = "没有已获取限额刷新时间的 Codex 账号";
               scheduleRender();
               return "wait";
             }
@@ -819,12 +828,12 @@ const managementPreheatScript = `<script>
             var resetTime = Date.parse(refresh.weekly_reset_at);
             if (!isNaN(resetTime) && resetTime <= Date.now()) {
               state.messageType = "muted";
-              state.message = "正在预热到达周限刷新时间的账号：" + labelOf(next);
+              state.message = "正在预热到达限额刷新时间的账号：" + labelOf(next);
               scheduleRender();
               return preheatAndRefreshAuthFile(next).then(function () { return "continue"; });
             }
             state.messageType = "muted";
-            state.message = "等待最近周限刷新：" + labelOf(next) + " " + formatResetTime(refresh.weekly_reset_at);
+            state.message = "等待最近限额刷新：" + labelOf(next) + " " + formatResetTime(refresh.weekly_reset_at);
             scheduleRender();
             return "wait";
           }).then(function (action) {

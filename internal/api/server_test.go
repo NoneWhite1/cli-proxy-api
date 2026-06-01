@@ -329,7 +329,15 @@ func TestManagementPreheatPanelNormalizesRefreshTimeState(t *testing.T) {
 		`exact_seven_day_refresh`,
 		`preheat_needed`,
 		`weekly_reset_at`,
-		`var weeklyWindowSeconds = 604800`,
+		`var monthlyWindowSeconds = [2419200, 2505600, 2592000, 2678400]`,
+		`var quotaResetWindowSeconds = monthlyWindowSeconds`,
+		`function isQuotaResetWindowSeconds`,
+		`function quotaResetWindowOf`,
+		`return { window: windowValue, seconds: seconds }`,
+		`var quotaWindowSeconds = quotaWindow.seconds`,
+		`var quotaWindowValue = quotaWindow.window`,
+		`Math.round(resetAfter) === quotaWindowSeconds`,
+		`Math.round(resetAtDelta) === quotaWindowSeconds`,
 		`var authFileFieldsEndpoint = "/v0/management/auth-files/fields"`,
 		`function refreshStatePayload`,
 		`function persistRefreshStateForAuthFile`,
@@ -352,9 +360,13 @@ func TestManagementPreheatPanelNormalizesRefreshTimeState(t *testing.T) {
 		`function saveRefreshState`,
 		`localStorage.setItem(refreshStateStorageKey`,
 		`localStorage.getItem(refreshStateStorageKey`,
+		`isQuotaResetWindowSeconds(resetAfter)`,
+		`isQuotaResetWindowSeconds(resetAtDelta)`,
+		`legacyWeeklyWindowSeconds`,
+		`604` + `800`,
 	} {
 		if strings.Contains(script, token) {
-			t.Fatalf("preheat script should store refresh-time state in auth files, not browser localStorage token %q", token)
+			t.Fatalf("preheat script should not contain stale refresh-time token %q", token)
 		}
 	}
 }
@@ -378,18 +390,18 @@ func TestManagementPreheatPanelFetchesSelectedRefreshTimesSequentially(t *testin
 	}
 }
 
-func TestManagementPreheatPanelAutoPreheatUsesNearestWeeklyResetLoop(t *testing.T) {
+func TestManagementPreheatPanelAutoPreheatUsesNearestQuotaResetLoop(t *testing.T) {
 	script := managementPreheatScript
 	for _, token := range []string{
 		`function autoPreheatLoop`,
-		`function sortWeeklyResetAuthFiles`,
+		`function sortResetAuthFiles`,
 		`var next = scheduled[0]`,
 		`Date.now()`,
 		`preheatAndRefreshAuthFile(next)`,
 		`var autoPreheatLoopIntervalMs = 60000`,
 		`if (action === "continue") return sleep(autoPreheatLoopIntervalMs).then(autoPreheatLoop)`,
 		`return sleep(autoPreheatLoopIntervalMs).then(autoPreheatLoop)`,
-		`function exactSevenDayRefreshAuthFiles`,
+		`function exactRefreshAuthFiles`,
 		`preheatAndRefreshWithInterval(exact)`,
 	} {
 		if !strings.Contains(script, token) {
@@ -460,9 +472,9 @@ func TestManagementPreheatPanelBlocksManualActionsDuringAutoPreheat(t *testing.T
 	}
 }
 
-func TestManagementPreheatPanelNoLongerUsesStaticSevenDayAuthMetadata(t *testing.T) {
+func TestManagementPreheatPanelNoLongerUsesStaticRefreshIntervalAuthMetadata(t *testing.T) {
 	script := managementPreheatScript
-	for _, token := range []string{`function refreshIntervalOf`, `function planTypeOf`, `function sevenDayRefreshIntervalCodexAuthFiles`, `refreshIntervalOf(file) === sevenDayRefreshIntervalMs`, `planTypeOf(file) === "free"`} {
+	for _, token := range []string{`function refreshIntervalOf`, `function planTypeOf`, `function sevenDayRefreshIntervalCodexAuthFiles`, `refreshIntervalOf(file) === sevenDayRefreshIntervalMs`, `planTypeOf(file) === "free"`, `function weeklyWindowOf`, `var weeklyWindowSeconds`, `function sortWeeklyResetAuthFiles`, `function exactSevenDayRefreshAuthFiles`, `等待周限刷新`, `7 天刷新时间`} {
 		if strings.Contains(script, token) {
 			t.Fatalf("preheat script should not rely on stale auth-files metadata heuristic %q", token)
 		}
