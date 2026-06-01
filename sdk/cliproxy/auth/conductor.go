@@ -2568,8 +2568,8 @@ func autoQuotaRecoveryAt(auth *Auth) (time.Time, bool) {
 	return recoverAt, true
 }
 
-// ClearAutoQuotaDisabledState removes the marker used by automatic Codex quota
-// disablement so a later recovery pass cannot re-enable an operator-disabled auth.
+// ClearAutoQuotaDisabledState removes automatic Codex quota recovery markers
+// when an operator explicitly enables an auth and no pending recovery is needed.
 func ClearAutoQuotaDisabledState(auth *Auth) {
 	if auth == nil {
 		return

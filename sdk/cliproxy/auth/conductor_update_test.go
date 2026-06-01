@@ -246,7 +246,47 @@ func TestManager_CodexQuotaRecoveryLoopKeepsNotDueCredentialDisabled(t *testing.
 	}
 }
 
-func TestManager_CodexQuotaRecoveryLoopDoesNotRecoverManualDisable(t *testing.T) {
+func TestManager_CodexQuotaRecoveryLoopRecoversManualDisableWithAutoQuotaMarker(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m.StartAutoRefresh(ctx, time.Hour)
+	defer m.StopAutoRefresh()
+
+	if _, errRegister := m.Register(ctx, &Auth{ID: "codex-manual-recover", Provider: "codex", Status: StatusActive, Metadata: map[string]any{"access_token": "token"}}); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	retryAfter := 25 * time.Millisecond
+	m.MarkResult(ctx, Result{
+		AuthID:     "codex-manual-recover",
+		Provider:   "codex",
+		Model:      "gpt-5",
+		Success:    false,
+		RetryAfter: &retryAfter,
+		Error:      &Error{HTTPStatus: http.StatusTooManyRequests, Message: `{"error":{"type":"usage_limit_reached"}}`},
+	})
+
+	manual, ok := m.GetByID("codex-manual-recover")
+	if !ok || manual == nil {
+		t.Fatal("expected auth to be present")
+	}
+	if !manual.Disabled || manual.Status != StatusDisabled || manual.Quota.Reason != quotaAutoDisabledReason {
+		t.Fatalf("expected auto quota disabled auth before manual update, got disabled=%v status=%q quota=%+v", manual.Disabled, manual.Status, manual.Quota)
+	}
+	manual.Disabled = true
+	manual.Status = StatusDisabled
+	manual.StatusMessage = "disabled via management API"
+	if _, errUpdate := m.Update(ctx, manual); errUpdate != nil {
+		t.Fatalf("manual update: %v", errUpdate)
+	}
+
+	waitForQuotaRecoveryCondition(t, time.Second, func() bool {
+		updated, okUpdated := m.GetByID("codex-manual-recover")
+		return okUpdated && updated != nil && !updated.Disabled && updated.Status == StatusActive && !updated.Quota.Exceeded && updated.Quota.Reason == ""
+	})
+}
+
+func TestManager_CodexQuotaRecoveryLoopDoesNotRecoverManualDisableWithoutAutoQuotaMarker(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
