@@ -280,3 +280,67 @@ func TestPatchAuthFileFields_ArbitraryFieldsPersistToFile(t *testing.T) {
 		t.Fatalf("fgh.ijk = %#v, want true", got)
 	}
 }
+
+func TestPatchAuthFileFields_RefreshStateFieldsPersistToFile(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	fileName := "codex-refresh.json"
+	filePath := filepath.Join(authDir, fileName)
+	store := fileauth.NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:       fileName,
+		FileName: fileName,
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path": filePath,
+		},
+		Metadata: map[string]any{
+			"type": "codex",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+	body := `{"name":"codex-refresh.json","fetched_refresh_time":true,"exact_seven_day_refresh":false,"preheat_needed":false,"weekly_reset_at":"2026-06-08T12:00:00Z","fetched_at":"2026-06-01T12:00:00Z"}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileFields(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	raw, errRead := os.ReadFile(filePath)
+	if errRead != nil {
+		t.Fatalf("failed to read updated auth file: %v", errRead)
+	}
+	var data map[string]any
+	if errUnmarshal := json.Unmarshal(raw, &data); errUnmarshal != nil {
+		t.Fatalf("failed to unmarshal updated auth file: %v", errUnmarshal)
+	}
+	if got := data["fetched_refresh_time"]; got != true {
+		t.Fatalf("fetched_refresh_time = %#v, want true", got)
+	}
+	if got := data["exact_seven_day_refresh"]; got != false {
+		t.Fatalf("exact_seven_day_refresh = %#v, want false", got)
+	}
+	if got := data["preheat_needed"]; got != false {
+		t.Fatalf("preheat_needed = %#v, want false", got)
+	}
+	if got := data["weekly_reset_at"]; got != "2026-06-08T12:00:00Z" {
+		t.Fatalf("weekly_reset_at = %#v, want %q", got, "2026-06-08T12:00:00Z")
+	}
+	if got := data["fetched_at"]; got != "2026-06-01T12:00:00Z" {
+		t.Fatalf("fetched_at = %#v, want %q", got, "2026-06-01T12:00:00Z")
+	}
+}

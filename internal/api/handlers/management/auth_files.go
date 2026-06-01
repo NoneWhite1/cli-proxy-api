@@ -41,13 +41,16 @@ import (
 )
 
 var lastRefreshKeys = []string{"last_refresh", "lastRefresh", "last_refreshed_at", "lastRefreshedAt"}
+var refreshIntervalKeys = []string{"refresh_interval_seconds", "refreshIntervalSeconds", "refresh_interval", "refreshInterval"}
+var refreshStateKeys = []string{"fetched_refresh_time", "exact_seven_day_refresh", "preheat_needed", "weekly_reset_at", "fetched_at"}
 
 const (
-	anthropicCallbackPort = 54545
-	geminiCallbackPort    = 8085
-	codexCallbackPort     = 1455
-	geminiCLIEndpoint     = "https://cloudcode-pa.googleapis.com"
-	geminiCLIVersion      = "v1internal"
+	anthropicCallbackPort        = 54545
+	geminiCallbackPort           = 8085
+	codexCallbackPort            = 1455
+	codexQuotaAutoDisabledReason = "codex_quota_auto_disabled"
+	geminiCLIEndpoint            = "https://cloudcode-pa.googleapis.com"
+	geminiCLIVersion             = "v1internal"
 )
 
 type callbackForwarder struct {
@@ -364,6 +367,8 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 						}
 					}
 				}
+				copyRefreshIntervalFieldsFromJSON(fileData, data)
+				copyRefreshStateFieldsFromJSON(fileData, data)
 			}
 
 			files = append(files, fileData)
@@ -434,6 +439,9 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if !auth.NextRetryAfter.IsZero() {
 		entry["next_retry_after"] = auth.NextRetryAfter
 	}
+	if authQuotaAutoDisabled(auth) {
+		entry["quota_auto_disabled"] = true
+	}
 	if path != "" {
 		entry["path"] = path
 		entry["source"] = "file"
@@ -452,6 +460,9 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	}
 	if claims := extractCodexIDTokenClaims(auth); claims != nil {
 		entry["id_token"] = claims
+	}
+	if planType := authPlanType(auth); planType != "" {
+		entry["plan_type"] = planType
 	}
 	// Expose priority from Attributes (set by synthesizer from JSON "priority" field).
 	// Fall back to Metadata for auths registered via UploadAuthFile (no synthesizer).
@@ -487,7 +498,101 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if websockets, ok := authWebsocketsValue(auth); ok {
 		entry["websockets"] = websockets
 	}
+	copyRefreshIntervalFieldsFromAuth(entry, auth)
+	copyRefreshStateFieldsFromAuth(entry, auth)
 	return entry
+}
+
+func copyRefreshIntervalFieldsFromAuth(entry gin.H, auth *coreauth.Auth) {
+	if entry == nil || auth == nil {
+		return
+	}
+	for _, key := range refreshIntervalKeys {
+		if auth.Metadata != nil {
+			if value, ok := auth.Metadata[key]; ok {
+				entry[key] = value
+				continue
+			}
+		}
+		if auth.Attributes != nil {
+			if value := strings.TrimSpace(auth.Attributes[key]); value != "" {
+				entry[key] = value
+			}
+		}
+	}
+}
+
+func copyRefreshIntervalFieldsFromJSON(entry gin.H, data []byte) {
+	if entry == nil || len(data) == 0 {
+		return
+	}
+	for _, key := range refreshIntervalKeys {
+		value := gjson.GetBytes(data, key)
+		if !value.Exists() {
+			continue
+		}
+		switch value.Type {
+		case gjson.Number, gjson.String:
+			entry[key] = value.Value()
+		}
+	}
+}
+
+func copyRefreshStateFieldsFromAuth(entry gin.H, auth *coreauth.Auth) {
+	if entry == nil || auth == nil {
+		return
+	}
+	for _, key := range refreshStateKeys {
+		if auth.Metadata != nil {
+			if value, ok := auth.Metadata[key]; ok {
+				copyRefreshStateValue(entry, key, value)
+				continue
+			}
+		}
+		if auth.Attributes != nil {
+			if value := strings.TrimSpace(auth.Attributes[key]); value != "" {
+				copyRefreshStateValue(entry, key, value)
+			}
+		}
+	}
+}
+
+func copyRefreshStateFieldsFromJSON(entry gin.H, data []byte) {
+	if entry == nil || len(data) == 0 {
+		return
+	}
+	for _, key := range refreshStateKeys {
+		value := gjson.GetBytes(data, key)
+		if !value.Exists() {
+			continue
+		}
+		switch key {
+		case "fetched_refresh_time", "exact_seven_day_refresh", "preheat_needed":
+			if value.Type == gjson.True || value.Type == gjson.False {
+				entry[key] = value.Bool()
+			}
+		case "weekly_reset_at", "fetched_at":
+			if value.Type == gjson.String {
+				entry[key] = value.String()
+			}
+		}
+	}
+}
+
+func copyRefreshStateValue(entry gin.H, key string, value any) {
+	if entry == nil {
+		return
+	}
+	switch key {
+	case "fetched_refresh_time", "exact_seven_day_refresh", "preheat_needed":
+		if parsed, ok := authFileBoolValue(value); ok {
+			entry[key] = parsed
+		}
+	case "weekly_reset_at", "fetched_at":
+		if text, ok := value.(string); ok {
+			entry[key] = text
+		}
+	}
 }
 
 func authWebsocketsValue(auth *coreauth.Auth) (bool, bool) {
@@ -601,6 +706,35 @@ func authEmail(auth *coreauth.Auth) string {
 		}
 	}
 	return ""
+}
+
+func authPlanType(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if planType := strings.TrimSpace(authAttribute(auth, "plan_type")); planType != "" {
+		return planType
+	}
+	if auth.Metadata != nil {
+		for _, key := range []string{"plan_type", "planType"} {
+			if value, ok := auth.Metadata[key].(string); ok {
+				if planType := strings.TrimSpace(value); planType != "" {
+					return planType
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func authQuotaAutoDisabled(auth *coreauth.Auth) bool {
+	if auth == nil {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		return false
+	}
+	return auth.Quota.Exceeded && auth.Quota.Reason == codexQuotaAutoDisabledReason
 }
 
 func authAttribute(auth *coreauth.Auth, key string) string {
