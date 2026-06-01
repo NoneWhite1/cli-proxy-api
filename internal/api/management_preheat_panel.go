@@ -545,6 +545,18 @@ const managementPreheatScript = `<script>
           }
         }
 
+        function firstDefinedValue(object, keys) {
+          if (!object || typeof object !== "object") return undefined;
+          for (var i = 0; i < keys.length; i++) {
+            if (Object.prototype.hasOwnProperty.call(object, keys[i])) return object[keys[i]];
+          }
+          return undefined;
+        }
+
+        function apiCallBodyOf(data) {
+          return firstDefinedValue(data, ["body", "bodyText", "body_text"]);
+        }
+
         function base64URLDecode(value) {
           try {
             var normalized = String(value || "").replace(/-/g, "+").replace(/_/g, "/");
@@ -602,17 +614,33 @@ const managementPreheatScript = `<script>
           return quotaResetWindowSeconds.indexOf(seconds) !== -1;
         }
 
+        function appendRateLimitCandidate(candidates, rateLimit) {
+          if (rateLimit && typeof rateLimit === "object") candidates.push(rateLimit);
+        }
+
+        function rateLimitCandidatesOf(usage) {
+          var candidates = [];
+          if (!usage || typeof usage !== "object") return candidates;
+          appendRateLimitCandidate(candidates, usage.rate_limit || usage.rateLimit);
+          appendRateLimitCandidate(candidates, usage.code_review_rate_limit || usage.codeReviewRateLimit || usage.code_review_rate_limits || usage.codeReviewRateLimits);
+          var additional = usage.additional_rate_limits || usage.additionalRateLimits;
+          if (additional && !Array.isArray(additional)) additional = [additional];
+          (additional || []).forEach(function (item) {
+            appendRateLimitCandidate(candidates, item && (item.rate_limit || item.rateLimit));
+          });
+          return candidates;
+        }
+
         function quotaResetWindowOf(usage) {
-          if (!usage || typeof usage !== "object") return null;
-          var rateLimits = [usage.rate_limit || usage.rateLimit, usage.code_review_rate_limit || usage.codeReviewRateLimit];
+          var rateLimits = rateLimitCandidatesOf(usage);
           for (var i = 0; i < rateLimits.length; i++) {
             var rateLimit = rateLimits[i];
             if (!rateLimit || typeof rateLimit !== "object") continue;
-            var windows = [rateLimit.primary_window || rateLimit.primaryWindow, rateLimit.secondary_window || rateLimit.secondaryWindow];
+            var windows = [rateLimit.primary_window || rateLimit.primaryWindow || rateLimit.primary, rateLimit.secondary_window || rateLimit.secondaryWindow || rateLimit.secondary];
             for (var j = 0; j < windows.length; j++) {
               var windowValue = windows[j];
               if (!windowValue || typeof windowValue !== "object") continue;
-              var seconds = numberValue(windowValue.limit_window_seconds || windowValue.limitWindowSeconds);
+              var seconds = numberValue(firstDefinedValue(windowValue, ["limit_window_seconds", "limitWindowSeconds"]));
               seconds = Math.round(seconds || 0);
               if (isQuotaResetWindowSeconds(seconds)) return { window: windowValue, seconds: seconds };
             }
@@ -626,8 +654,8 @@ const managementPreheatScript = `<script>
           var quotaWindowSeconds = quotaWindow.seconds;
           var quotaWindowValue = quotaWindow.window;
           var now = Date.now();
-          var resetAfter = numberValue(quotaWindowValue.reset_after_seconds || quotaWindowValue.resetAfterSeconds);
-          var resetAt = numberValue(quotaWindowValue.reset_at || quotaWindowValue.resetAt);
+          var resetAfter = numberValue(firstDefinedValue(quotaWindowValue, ["reset_after_seconds", "resetAfterSeconds"]));
+          var resetAt = numberValue(firstDefinedValue(quotaWindowValue, ["reset_at", "resetAt"]));
           var resetAtDelta = resetAt !== null && resetAt > 0 ? resetAt - Math.floor(now / 1000) : null;
           var normalized = {
             fetched_refresh_time: true,
@@ -697,16 +725,14 @@ const managementPreheatScript = `<script>
             url: codexUsageEndpoint,
             header: headers
           }).then(function (data) {
-            var statusCode = numberValue(data.status_code || data.statusCode) || 0;
-            if (statusCode < 200 || statusCode >= 300) throw new Error(String(data.body || data.bodyText || "获取刷新时间失败"));
-            var usage = parseMaybeJSON(data.body || data.bodyText);
+            var responseBody = apiCallBodyOf(data);
+            var statusCode = numberValue(firstDefinedValue(data, ["status_code", "statusCode"])) || 0;
+            if (statusCode < 200 || statusCode >= 300) throw new Error(String(responseBody || "获取刷新时间失败"));
+            var usage = parseMaybeJSON(responseBody);
+            if (!usage) throw new Error("解析 Codex 刷新时间失败");
             var normalized = normalizeCodexUsageRefreshState(usage);
             if (!normalized.fetched_refresh_time) {
-              return persistRefreshStateForAuthFile(file, normalized).then(function () {
-                delete state.refreshTimes[index];
-                scheduleRender();
-                return normalized;
-              });
+              throw new Error("未找到可识别的月限额刷新时间");
             }
             return persistRefreshStateForAuthFile(file, normalized).then(function () {
               state.refreshTimes[index] = normalized;
@@ -810,13 +836,19 @@ const managementPreheatScript = `<script>
           return loadAuthFilesForPreheat().then(function (files) {
             if (!state.autoRunning) return "stop";
             var exact = exactRefreshAuthFiles(files);
-            if (exact.length) {
-              state.messageType = "muted";
-              state.message = "正在处理已到达限额刷新时间的 Codex 账号：" + exact.length + " 个";
-              scheduleRender();
-              return preheatAndRefreshWithInterval(exact).then(function () { return "continue"; });
-            }
             var scheduled = sortResetAuthFiles(files);
+            var dueScheduled = scheduled.filter(function (file) {
+              var refresh = refreshStateFor(file);
+              var resetTime = Date.parse(refresh.weekly_reset_at);
+              return !isNaN(resetTime) && resetTime <= Date.now();
+            });
+            var due = exact.concat(dueScheduled);
+            if (due.length) {
+              state.messageType = "muted";
+              state.message = "正在处理已到达限额刷新时间的 Codex 账号：" + due.length + " 个";
+              scheduleRender();
+              return preheatAndRefreshWithInterval(due).then(function () { return "continue"; });
+            }
             var next = scheduled[0];
             if (!next) {
               state.messageType = "muted";
@@ -825,13 +857,6 @@ const managementPreheatScript = `<script>
               return "wait";
             }
             var refresh = refreshStateFor(next);
-            var resetTime = Date.parse(refresh.weekly_reset_at);
-            if (!isNaN(resetTime) && resetTime <= Date.now()) {
-              state.messageType = "muted";
-              state.message = "正在预热到达限额刷新时间的账号：" + labelOf(next);
-              scheduleRender();
-              return preheatAndRefreshAuthFile(next).then(function () { return "continue"; });
-            }
             state.messageType = "muted";
             state.message = "等待最近限额刷新：" + labelOf(next) + " " + formatResetTime(refresh.weekly_reset_at);
             scheduleRender();

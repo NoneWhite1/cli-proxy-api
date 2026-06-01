@@ -331,7 +331,11 @@ func TestManagementPreheatPanelNormalizesRefreshTimeState(t *testing.T) {
 		`weekly_reset_at`,
 		`var monthlyWindowSeconds = [2419200, 2505600, 2592000, 2678400]`,
 		`var quotaResetWindowSeconds = monthlyWindowSeconds`,
+		`function firstDefinedValue`,
+		`function apiCallBodyOf`,
 		`function isQuotaResetWindowSeconds`,
+		`function rateLimitCandidatesOf`,
+		`function appendRateLimitCandidate`,
 		`function quotaResetWindowOf`,
 		`return { window: windowValue, seconds: seconds }`,
 		`var quotaWindowSeconds = quotaWindow.seconds`,
@@ -349,6 +353,13 @@ func TestManagementPreheatPanelNormalizesRefreshTimeState(t *testing.T) {
 		`resetAfterSeconds`,
 		`reset_at`,
 		`resetAt`,
+		`additional_rate_limits`,
+		`additionalRateLimits`,
+		`code_review_rate_limits`,
+		`codeReviewRateLimits`,
+		`body_text`,
+		`bodyText`,
+		`未找到可识别的月限额刷新时间`,
 	} {
 		if !strings.Contains(script, token) {
 			t.Fatalf("preheat script missing normalized refresh-time token %q", token)
@@ -364,6 +375,8 @@ func TestManagementPreheatPanelNormalizesRefreshTimeState(t *testing.T) {
 		`isQuotaResetWindowSeconds(resetAtDelta)`,
 		`legacyWeeklyWindowSeconds`,
 		`604` + `800`,
+		`delete state.refreshTimes[index]`,
+		`data.body || data.bodyText`,
 	} {
 		if strings.Contains(script, token) {
 			t.Fatalf("preheat script should not contain stale refresh-time token %q", token)
@@ -395,14 +408,15 @@ func TestManagementPreheatPanelAutoPreheatUsesNearestQuotaResetLoop(t *testing.T
 	for _, token := range []string{
 		`function autoPreheatLoop`,
 		`function sortResetAuthFiles`,
+		`var dueScheduled = scheduled.filter`,
+		`var due = exact.concat(dueScheduled)`,
 		`var next = scheduled[0]`,
 		`Date.now()`,
-		`preheatAndRefreshAuthFile(next)`,
 		`var autoPreheatLoopIntervalMs = 60000`,
 		`if (action === "continue") return sleep(autoPreheatLoopIntervalMs).then(autoPreheatLoop)`,
 		`return sleep(autoPreheatLoopIntervalMs).then(autoPreheatLoop)`,
 		`function exactRefreshAuthFiles`,
-		`preheatAndRefreshWithInterval(exact)`,
+		`preheatAndRefreshWithInterval(due)`,
 	} {
 		if !strings.Contains(script, token) {
 			t.Fatalf("preheat script missing auto loop token %q", token)
@@ -413,6 +427,9 @@ func TestManagementPreheatPanelAutoPreheatUsesNearestQuotaResetLoop(t *testing.T
 	}
 	if strings.Contains(script, `if (action === "continue") return autoPreheatLoop()`) {
 		t.Fatalf("auto preheat should wait before continuing after a due credential")
+	}
+	if strings.Contains(script, `preheatAndRefreshAuthFile(next)`) {
+		t.Fatalf("auto preheat should batch all due scheduled credentials, not process only scheduled[0]")
 	}
 	if strings.Contains(script, `return sleep(preheatIntervalMs).then(autoPreheatLoop)`) {
 		t.Fatalf("auto preheat loop should use the 60s loop interval, not the per-credential interval")
