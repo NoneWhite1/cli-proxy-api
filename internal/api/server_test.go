@@ -269,14 +269,241 @@ func TestManagementPreheatPanelUsesAuthFilesSelection(t *testing.T) {
 	if !strings.Contains(script, `function selectedCodexAuthFiles`) {
 		t.Fatalf("preheat script should collect selected Codex rows from the auth-files page")
 	}
-	if !strings.Contains(script, `querySelectorAll("input[type='checkbox']:checked")`) {
-		t.Fatalf("preheat script should use existing checked auth-files page rows")
+	if !strings.Contains(script, `querySelectorAll("input[type='checkbox']")`) {
+		t.Fatalf("preheat script should sync existing auth-files page rows")
 	}
-	if !strings.Contains(script, `Promise.all(selected.map(preheatAuthFile))`) {
-		t.Fatalf("preheat script should preheat every selected credential")
+	if !strings.Contains(script, `preheatSelectedWithInterval(selected)`) {
+		t.Fatalf("preheat script should preheat every selected credential with spacing")
 	}
 	if !strings.Contains(script, `预热选中账号`) {
 		t.Fatalf("preheat script should add a preheat-selected action on the auth-files page")
+	}
+}
+
+func TestManagementPreheatPanelRendersRefreshTimeControls(t *testing.T) {
+	script := managementPreheatScript
+	for _, token := range []string{
+		`预热选中账号`,
+		`获取选中刷新时间`,
+		`只显示未获取刷新时间`,
+		`启动自动预热`,
+		`停止自动预热`,
+		`未获取刷新时间`,
+		`已获取刷新时间`,
+	} {
+		if !strings.Contains(script, token) {
+			t.Fatalf("preheat script missing refresh-time UI token %q", token)
+		}
+	}
+	for _, action := range []string{`data-preheat-action="manual"`, `data-preheat-action="fetch-refresh"`, `data-preheat-action="toggle-missing"`, `data-preheat-action="auto"`} {
+		if !strings.Contains(script, action) {
+			t.Fatalf("preheat script should render action %s", action)
+		}
+	}
+}
+
+func TestManagementPreheatPanelFetchesCodexRefreshTimeThroughAPICall(t *testing.T) {
+	script := managementPreheatScript
+	for _, token := range []string{
+		`var apiCallEndpoint = "/v0/management/api-call"`,
+		`https://chatgpt.com/backend-api/wham/usage`,
+		`Authorization: "Bearer $TOKEN$"`,
+		`Chatgpt-Account-Id`,
+		`function fetchRefreshTimeForAuthFile`,
+		`method: "GET"`,
+		`url: codexUsageEndpoint`,
+	} {
+		if !strings.Contains(script, token) {
+			t.Fatalf("preheat script should fetch structured Codex quota through management api-call; missing %q", token)
+		}
+	}
+	if strings.Contains(script, `codex_quota.reset_hint`) || strings.Contains(script, `周限额`) {
+		t.Fatalf("preheat script must not parse localized quota display strings")
+	}
+}
+
+func TestManagementPreheatPanelNormalizesRefreshTimeState(t *testing.T) {
+	script := managementPreheatScript
+	for _, token := range []string{
+		`fetched_refresh_time`,
+		`exact_seven_day_refresh`,
+		`preheat_needed`,
+		`weekly_reset_at`,
+		`var weeklyWindowSeconds = 604800`,
+		`var authFileFieldsEndpoint = "/v0/management/auth-files/fields"`,
+		`function refreshStatePayload`,
+		`function persistRefreshStateForAuthFile`,
+		`state.refreshTimes = nextRefreshTimes`,
+		`body: JSON.stringify(payload)`,
+		`limit_window_seconds`,
+		`limitWindowSeconds`,
+		`reset_after_seconds`,
+		`resetAfterSeconds`,
+		`reset_at`,
+		`resetAt`,
+	} {
+		if !strings.Contains(script, token) {
+			t.Fatalf("preheat script missing normalized refresh-time token %q", token)
+		}
+	}
+	for _, token := range []string{
+		`refreshStateStorageKey`,
+		`function loadRefreshState`,
+		`function saveRefreshState`,
+		`localStorage.setItem(refreshStateStorageKey`,
+		`localStorage.getItem(refreshStateStorageKey`,
+	} {
+		if strings.Contains(script, token) {
+			t.Fatalf("preheat script should store refresh-time state in auth files, not browser localStorage token %q", token)
+		}
+	}
+}
+
+func TestManagementPreheatPanelFetchesSelectedRefreshTimesSequentially(t *testing.T) {
+	script := managementPreheatScript
+	if !strings.Contains(script, `function fetchSelectedRefreshTimes`) {
+		t.Fatalf("preheat script should expose a selected refresh-time fetch action")
+	}
+	if !strings.Contains(script, `fetchRefreshTimesWithInterval(selected)`) {
+		t.Fatalf("selected refresh-time fetch should use the sequential helper")
+	}
+	if !strings.Contains(script, `function fetchRefreshTimesWithInterval`) {
+		t.Fatalf("preheat script should define a refresh-time sequential helper")
+	}
+	if !strings.Contains(script, `return sleep(preheatIntervalMs).then(function () { return fetchRefreshTimeForAuthFile(file); })`) {
+		t.Fatalf("refresh-time fetch should wait 1s between selected credentials")
+	}
+	if strings.Contains(script, `Promise.all(selected.map(fetchRefreshTimeForAuthFile))`) {
+		t.Fatalf("refresh-time fetch must not run selected credentials concurrently")
+	}
+}
+
+func TestManagementPreheatPanelAutoPreheatUsesNearestWeeklyResetLoop(t *testing.T) {
+	script := managementPreheatScript
+	for _, token := range []string{
+		`function autoPreheatLoop`,
+		`function sortWeeklyResetAuthFiles`,
+		`var next = scheduled[0]`,
+		`Date.now()`,
+		`preheatAndRefreshAuthFile(next)`,
+		`var autoPreheatLoopIntervalMs = 60000`,
+		`if (action === "continue") return sleep(autoPreheatLoopIntervalMs).then(autoPreheatLoop)`,
+		`return sleep(autoPreheatLoopIntervalMs).then(autoPreheatLoop)`,
+		`function exactSevenDayRefreshAuthFiles`,
+		`preheatAndRefreshWithInterval(exact)`,
+	} {
+		if !strings.Contains(script, token) {
+			t.Fatalf("preheat script missing auto loop token %q", token)
+		}
+	}
+	if strings.Contains(script, `Promise.all(exact.map`) || strings.Contains(script, `Promise.all(scheduled.map`) {
+		t.Fatalf("auto preheat should not process credentials concurrently")
+	}
+	if strings.Contains(script, `if (action === "continue") return autoPreheatLoop()`) {
+		t.Fatalf("auto preheat should wait before continuing after a due credential")
+	}
+	if strings.Contains(script, `return sleep(preheatIntervalMs).then(autoPreheatLoop)`) {
+		t.Fatalf("auto preheat loop should use the 60s loop interval, not the per-credential interval")
+	}
+}
+
+func TestManagementPreheatPanelAutoPreheatEnablesDisabledAuthBeforePreheatAndRefresh(t *testing.T) {
+	script := managementPreheatScript
+	for _, token := range []string{
+		`var authFileStatusEndpoint = "/v0/management/auth-files/status"`,
+		`function isDisabledAuthFile`,
+		`function authStatusNameOf`,
+		`function setAuthFileDisabled`,
+		`function enableAuthFileForPreheat`,
+		`method: "PATCH"`,
+		`body: JSON.stringify({ name: name, disabled: disabled })`,
+		`setAuthFileDisabled(file, false)`,
+		`refreshAuthFilesSoon(250)`,
+	} {
+		if !strings.Contains(script, token) {
+			t.Fatalf("preheat script missing disabled auth auto-enable token %q", token)
+		}
+	}
+
+	ordered := `return enableAuthFileForPreheat(file).then(function () { return preheatAuthFile(file); }).then(function () { return fetchRefreshTimeForAuthFile(file); });`
+	if !strings.Contains(script, ordered) {
+		t.Fatalf("auto preheat should enable disabled auth before preheating and refreshing")
+	}
+	if strings.Contains(script, `return preheatAuthFile(file).then(function () { return fetchRefreshTimeForAuthFile(file); });`) {
+		t.Fatalf("auto preheat should not bypass disabled auth enablement")
+	}
+}
+
+func TestManagementPreheatPanelAutoPreheatSkipsManualDisabledAuth(t *testing.T) {
+	script := managementPreheatScript
+	for _, token := range []string{
+		`function isAutoQuotaDisabledAuthFile`,
+		`function canAutoPreheatAuthFile`,
+		`quota_auto_disabled`,
+		`if (!isAutoQuotaDisabledAuthFile(file)) return Promise.reject`,
+		`canAutoPreheatAuthFile(file) && refresh.fetched_refresh_time`,
+	} {
+		if !strings.Contains(script, token) {
+			t.Fatalf("preheat script missing manual-disabled guard token %q", token)
+		}
+	}
+}
+
+func TestManagementPreheatPanelBlocksManualActionsDuringAutoPreheat(t *testing.T) {
+	script := managementPreheatScript
+	if !strings.Contains(script, `var manualBusy = state.loading || state.autoRunning || state.autoBusy || !originalFetch`) {
+		t.Fatalf("manual controls should be disabled while auto preheat owns credential operations")
+	}
+	guard := `if (state.loading || state.autoRunning || state.autoBusy || !originalFetch) return;`
+	if strings.Count(script, guard) < 2 {
+		t.Fatalf("manual preheat and refresh-time fetch handlers should return while auto preheat is active")
+	}
+}
+
+func TestManagementPreheatPanelNoLongerUsesStaticSevenDayAuthMetadata(t *testing.T) {
+	script := managementPreheatScript
+	for _, token := range []string{`function refreshIntervalOf`, `function planTypeOf`, `function sevenDayRefreshIntervalCodexAuthFiles`, `refreshIntervalOf(file) === sevenDayRefreshIntervalMs`, `planTypeOf(file) === "free"`} {
+		if strings.Contains(script, token) {
+			t.Fatalf("preheat script should not rely on stale auth-files metadata heuristic %q", token)
+		}
+	}
+}
+
+func TestManagementPreheatPanelRetainsSelectionAcrossPages(t *testing.T) {
+	script := managementPreheatScript
+	if !strings.Contains(script, `selectedAuthFiles: {}`) {
+		t.Fatalf("preheat script should retain selected Codex credentials outside the current page DOM")
+	}
+	if !strings.Contains(script, `function syncSelectedCodexAuthFiles`) {
+		t.Fatalf("preheat script should sync page selections into retained selection state")
+	}
+	if !strings.Contains(script, `state.selectedAuthFiles[index] = file`) {
+		t.Fatalf("preheat script should remember checked credentials by auth index")
+	}
+	if !strings.Contains(script, `delete state.selectedAuthFiles[index]`) {
+		t.Fatalf("preheat script should remove unchecked credentials from retained selection state")
+	}
+	if !strings.Contains(script, `Object.keys(state.selectedAuthFiles).map`) {
+		t.Fatalf("preheat script should preheat retained selections across auth-files pages")
+	}
+}
+
+func TestManagementPreheatPanelPreheatsSequentiallyWithDelay(t *testing.T) {
+	script := managementPreheatScript
+	if !strings.Contains(script, `var preheatIntervalMs = 1000`) {
+		t.Fatalf("preheat script should define a per-credential preheat interval")
+	}
+	if !strings.Contains(script, `function sleep(ms)`) {
+		t.Fatalf("preheat script should provide a delay helper for sequential preheating")
+	}
+	if !strings.Contains(script, `function preheatSelectedWithInterval`) {
+		t.Fatalf("preheat script should preheat selected credentials sequentially")
+	}
+	if strings.Contains(script, `Promise.all(selected.map(preheatAuthFile))`) {
+		t.Fatalf("preheat script should not preheat all selected credentials concurrently")
+	}
+	if !strings.Contains(script, `return sleep(preheatIntervalMs)`) {
+		t.Fatalf("preheat script should wait between credential preheat requests")
 	}
 }
 
