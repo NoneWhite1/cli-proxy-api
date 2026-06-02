@@ -90,20 +90,7 @@ func (h *Handler) PreheatCodexAuthFile(c *gin.Context) {
 		return
 	}
 
-	const model = "gpt-5.5"
-	payload := []byte(`{"model":"` + model + `","messages":[{"role":"user","content":"1"}],"stream":false}`)
-	_, errExecute := h.authManager.Execute(c.Request.Context(), []string{"codex"}, cliproxyexecutor.Request{
-		Model:   model,
-		Payload: payload,
-		Format:  sdktranslator.FormatOpenAI,
-	}, cliproxyexecutor.Options{
-		Stream:          false,
-		SourceFormat:    sdktranslator.FormatOpenAI,
-		OriginalRequest: payload,
-		Metadata: map[string]any{
-			cliproxyexecutor.PinnedAuthMetadataKey: auth.ID,
-		},
-	})
+	errExecute := h.preheatCodexAuth(c.Request.Context(), auth)
 	if errExecute != nil {
 		statusCode := http.StatusBadGateway
 		if statusErr, ok := errExecute.(cliproxyexecutor.StatusError); ok && statusErr != nil {
@@ -115,7 +102,34 @@ func (h *Handler) PreheatCodexAuthFile(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"ok": true, "auth_index": authIndex, "auth_id": auth.ID, "model": model})
+	c.JSON(http.StatusOK, gin.H{"ok": true, "auth_index": authIndex, "auth_id": auth.ID, "model": "gpt-5.5"})
+}
+
+func (h *Handler) preheatCodexAuth(ctx context.Context, auth *coreauth.Auth) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if h == nil || h.authManager == nil {
+		return fmt.Errorf("auth manager unavailable")
+	}
+	if auth == nil {
+		return fmt.Errorf("auth not found")
+	}
+	const model = "gpt-5.5"
+	payload := []byte(`{"model":"` + model + `","messages":[{"role":"user","content":"1"}],"stream":false}`)
+	_, errExecute := h.authManager.Execute(ctx, []string{"codex"}, cliproxyexecutor.Request{
+		Model:   model,
+		Payload: payload,
+		Format:  sdktranslator.FormatOpenAI,
+	}, cliproxyexecutor.Options{
+		Stream:          false,
+		SourceFormat:    sdktranslator.FormatOpenAI,
+		OriginalRequest: payload,
+		Metadata: map[string]any{
+			cliproxyexecutor.PinnedAuthMetadataKey: auth.ID,
+		},
+	})
+	return errExecute
 }
 
 // APICall makes a generic HTTP request on behalf of the management API caller.

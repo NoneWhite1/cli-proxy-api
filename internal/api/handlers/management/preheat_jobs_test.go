@@ -1,0 +1,364 @@
+package management
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+)
+
+func TestPreheatJobRequestParsingAndStatusRoute(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	manager := coreauth.NewManager(nil, nil, nil)
+	auth := &coreauth.Auth{ID: "codex-one", Provider: "codex", Status: coreauth.StatusActive, Metadata: map[string]any{"type": "codex"}}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	done := make(chan struct{})
+	release := make(chan struct{})
+	h.preheatJobs.preheatHook = func(context.Context, *coreauth.Auth) error {
+		close(done)
+		<-release
+		return nil
+	}
+
+	body := `{"operation":"preheat","authIndices":["` + auth.EnsureIndex() + `"]}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/auth-files/preheat/jobs", strings.NewReader(body))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	h.StartPreheatJob(ctx)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("start status = %d, want %d body=%s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	var start map[string]any
+	if errUnmarshal := json.Unmarshal(rec.Body.Bytes(), &start); errUnmarshal != nil {
+		t.Fatalf("decode start response: %v", errUnmarshal)
+	}
+	jobID, _ := start["job_id"].(string)
+	if jobID == "" {
+		t.Fatalf("job_id missing from response: %#v", start)
+	}
+	if got := start["operation"]; got != preheatOperationPreheat {
+		t.Fatalf("operation = %#v, want %q", got, preheatOperationPreheat)
+	}
+	if got := int(start["total"].(float64)); got != 1 {
+		t.Fatalf("total = %d, want 1", got)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("preheat hook did not start")
+	}
+
+	statusRec := httptest.NewRecorder()
+	statusCtx, _ := gin.CreateTestContext(statusRec)
+	statusCtx.Params = gin.Params{{Key: "job_id", Value: jobID}}
+	statusCtx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files/preheat/jobs/"+jobID, nil)
+	h.GetPreheatJob(statusCtx)
+	if statusRec.Code != http.StatusAccepted {
+		t.Fatalf("running status route = %d, want %d body=%s", statusRec.Code, http.StatusAccepted, statusRec.Body.String())
+	}
+
+	close(release)
+	waitForJobTerminal(t, h.preheatJobs, jobID)
+	terminalRec := httptest.NewRecorder()
+	terminalCtx, _ := gin.CreateTestContext(terminalRec)
+	terminalCtx.Params = gin.Params{{Key: "job_id", Value: jobID}}
+	terminalCtx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files/preheat/jobs/"+jobID, nil)
+	h.GetPreheatJob(terminalCtx)
+	if terminalRec.Code != http.StatusOK {
+		t.Fatalf("terminal status route = %d, want %d body=%s", terminalRec.Code, http.StatusOK, terminalRec.Body.String())
+	}
+}
+
+func TestPreheatJobUsesDetachedContext(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	auth := &coreauth.Auth{ID: "codex-detached", Provider: "codex", Status: coreauth.StatusActive, Metadata: map[string]any{"type": "codex"}}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	seen := make(chan error, 1)
+	h.preheatJobs.preheatHook = func(ctx context.Context, _ *coreauth.Auth) error {
+		select {
+		case <-ctx.Done():
+			seen <- ctx.Err()
+		default:
+			seen <- nil
+		}
+		return nil
+	}
+
+	reqCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	body := `{"operation":"preheat","auth_index":"` + auth.EnsureIndex() + `"}`
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/auth-files/preheat/jobs", strings.NewReader(body)).WithContext(reqCtx)
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	h.StartPreheatJob(ctx)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("start status = %d, want %d body=%s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	select {
+	case err := <-seen:
+		if err != nil {
+			t.Fatalf("job context was canceled by request: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("job did not run")
+	}
+}
+
+func TestPreheatJobDedupesConcurrentAuthWork(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	auth := &coreauth.Auth{ID: "codex-dedupe", Provider: "codex", Status: coreauth.StatusActive, Metadata: map[string]any{"type": "codex"}}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls int
+	var callsMu sync.Mutex
+	h.preheatJobs.preheatHook = func(context.Context, *coreauth.Auth) error {
+		callsMu.Lock()
+		calls++
+		callsMu.Unlock()
+		select {
+		case <-started:
+		default:
+			close(started)
+		}
+		<-release
+		return nil
+	}
+
+	first := h.preheatJobs.startJob(preheatOperationPreheat, "manual", []*coreauth.Auth{auth})
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first job did not start")
+	}
+	second := h.preheatJobs.startJob(preheatOperationPreheat, "manual", []*coreauth.Auth{auth})
+	if second.Deduped != 1 || second.Completed != 1 {
+		t.Fatalf("second job dedupe/completed = %d/%d, want 1/1", second.Deduped, second.Completed)
+	}
+	if got := second.Items[0].Status; got != preheatJobStatusSkipped {
+		t.Fatalf("deduped item status = %q, want %q", got, preheatJobStatusSkipped)
+	}
+	close(release)
+	waitForJobTerminal(t, h.preheatJobs, first.ID)
+	callsMu.Lock()
+	gotCalls := calls
+	callsMu.Unlock()
+	if gotCalls != 1 {
+		t.Fatalf("preheat calls = %d, want 1", gotCalls)
+	}
+}
+
+func TestPreheatJobStartReturnsStableSnapshot(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	auth := &coreauth.Auth{ID: "codex-snapshot", Provider: "codex", Status: coreauth.StatusActive, Metadata: map[string]any{"type": "codex"}}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	h.preheatJobs.preheatHook = func(context.Context, *coreauth.Auth) error { return nil }
+
+	snapshot := h.preheatJobs.startJob(preheatOperationPreheat, "manual", []*coreauth.Auth{auth})
+	waitForJobTerminal(t, h.preheatJobs, snapshot.ID)
+
+	if snapshot.Status != preheatJobStatusQueued {
+		t.Fatalf("returned job snapshot status mutated to %q, want initial queued", snapshot.Status)
+	}
+	if snapshot.Completed != 0 {
+		t.Fatalf("returned job snapshot completed mutated to %d, want 0", snapshot.Completed)
+	}
+	stored, ok := h.preheatJobs.job(snapshot.ID)
+	if !ok {
+		t.Fatal("stored job missing")
+	}
+	if stored.Status != preheatJobStatusSucceeded || stored.Completed != 1 {
+		t.Fatalf("stored job = status %q completed %d, want succeeded/1", stored.Status, stored.Completed)
+	}
+}
+
+func TestNormalizeCodexUsageRefreshStateRejectsWeeklyWindow(t *testing.T) {
+	usage := map[string]any{
+		"rate_limit": map[string]any{
+			"primary_window": map[string]any{
+				"limit_window_seconds": float64(604800),
+				"reset_after_seconds":  float64(604800),
+			},
+		},
+	}
+	if _, err := normalizeCodexUsageRefreshState(usage, time.Unix(100, 0)); err == nil {
+		t.Fatal("expected weekly 604800 window to be rejected")
+	}
+}
+
+func TestPersistCodexRefreshStateOnlyWritesRefreshStateFields(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	auth := &coreauth.Auth{
+		ID:       "codex-refresh",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"type":                    "codex",
+			"access_token":            "keep-token",
+			"fetched_refresh_time":    false,
+			"exact_seven_day_refresh": true,
+			"preheat_needed":          true,
+			"weekly_reset_at":         "old",
+			"fetched_at":              "old",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	state := codexRefreshState{FetchedRefreshTime: true, ExactSevenDayRefresh: false, PreheatNeeded: false, WeeklyResetAt: "2026-06-08T12:00:00Z", FetchedAt: "2026-06-01T12:00:00Z"}
+	if err := h.persistCodexRefreshState(context.Background(), auth.ID, state); err != nil {
+		t.Fatalf("persist refresh state: %v", err)
+	}
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatal("updated auth missing")
+	}
+	if got := updated.Metadata["access_token"]; got != "keep-token" {
+		t.Fatalf("access_token = %#v, want preserved", got)
+	}
+	if got := updated.Metadata["fetched_refresh_time"]; got != true {
+		t.Fatalf("fetched_refresh_time = %#v, want true", got)
+	}
+	if got := updated.Metadata["exact_seven_day_refresh"]; got != false {
+		t.Fatalf("exact_seven_day_refresh = %#v, want false", got)
+	}
+	if got := updated.Metadata["preheat_needed"]; got != false {
+		t.Fatalf("preheat_needed = %#v, want false", got)
+	}
+	if got := updated.Metadata["weekly_reset_at"]; got != state.WeeklyResetAt {
+		t.Fatalf("weekly_reset_at = %#v, want %q", got, state.WeeklyResetAt)
+	}
+	if got := updated.Metadata["fetched_at"]; got != state.FetchedAt {
+		t.Fatalf("fetched_at = %#v, want %q", got, state.FetchedAt)
+	}
+}
+
+func TestUsageStartLimiterSpacesStartsByOneSecond(t *testing.T) {
+	base := time.Unix(1000, 0)
+	var sleeps []time.Duration
+	limiter := &usageStartLimiter{
+		interval:  time.Second,
+		nextStart: base.Add(time.Second),
+		now: func() time.Time {
+			return base
+		},
+		sleep: func(d time.Duration) {
+			sleeps = append(sleeps, d)
+		},
+	}
+	if err := limiter.wait(context.Background()); err != nil {
+		t.Fatalf("wait returned error: %v", err)
+	}
+	if len(sleeps) != 1 || sleeps[0] != time.Second {
+		t.Fatalf("sleeps = %v, want [1s]", sleeps)
+	}
+}
+
+func TestUsageStartLimiterConcurrentReservationsAreSpaced(t *testing.T) {
+	base := time.Unix(2000, 0)
+	const callers = 4
+	var mu sync.Mutex
+	sleeps := make([]time.Duration, 0, callers-1)
+	limiter := &usageStartLimiter{
+		interval: 10 * time.Millisecond,
+		now: func() time.Time {
+			return base
+		},
+		sleep: func(d time.Duration) {
+			mu.Lock()
+			sleeps = append(sleeps, d)
+			mu.Unlock()
+		},
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- limiter.wait(context.Background())
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("wait returned error: %v", err)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(sleeps) != callers-1 {
+		t.Fatalf("recorded sleeps = %v, want %d delayed callers", sleeps, callers-1)
+	}
+	want := map[time.Duration]int{
+		10 * time.Millisecond: 1,
+		20 * time.Millisecond: 1,
+		30 * time.Millisecond: 1,
+	}
+	for _, sleep := range sleeps {
+		want[sleep]--
+	}
+	for duration, count := range want {
+		if count != 0 {
+			t.Fatalf("sleep reservations = %v, missing/extra count for %s: %d", sleeps, duration, count)
+		}
+	}
+}
+
+func TestUsageStartLimiterCanceledWaitReturnsError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	base := time.Unix(3000, 0)
+	limiter := &usageStartLimiter{
+		interval:  time.Second,
+		nextStart: base.Add(time.Second),
+		now:       func() time.Time { return base },
+		sleep: func(time.Duration) {
+			t.Fatal("sleep should not run after context cancellation")
+		},
+	}
+	if err := limiter.wait(ctx); err == nil {
+		t.Fatal("expected canceled wait to return an error")
+	}
+}
+
+func waitForJobTerminal(t *testing.T, manager *preheatJobManager, jobID string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		job, ok := manager.job(jobID)
+		if ok && isTerminalJobStatus(job.Status) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	job, _ := manager.job(jobID)
+	t.Fatalf("job %s did not become terminal: %#v", jobID, job)
+}

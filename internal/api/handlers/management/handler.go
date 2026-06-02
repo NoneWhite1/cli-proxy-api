@@ -46,6 +46,7 @@ type Handler struct {
 	envSecret           string
 	logDir              string
 	postAuthHook        coreauth.PostAuthHook
+	preheatJobs         *preheatJobManager
 }
 
 // NewHandler creates a new management handler instance.
@@ -62,6 +63,7 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		allowRemoteOverride: envSecret != "",
 		envSecret:           envSecret,
 	}
+	h.preheatJobs = newPreheatJobManager(h)
 	h.startAttemptCleanup()
 	return h
 }
