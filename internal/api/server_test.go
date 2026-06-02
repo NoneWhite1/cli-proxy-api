@@ -259,6 +259,9 @@ func TestManagementPreheatPanelRefreshesAfterAuthFileMutation(t *testing.T) {
 	if !strings.Contains(script, `refreshAuthFilesSoon(250)`) {
 		t.Fatalf("preheat script should schedule a refresh after successful auth file mutations")
 	}
+	if !strings.Contains(script, `loadAuthFilesForPreheat().then(function () { scheduleRender(); }).catch(function () { scheduleRender(); })`) {
+		t.Fatalf("preheat script should load the authoritative auth-files list after mutations")
+	}
 }
 
 func TestManagementPreheatPanelUsesAuthFilesSelection(t *testing.T) {
@@ -272,8 +275,8 @@ func TestManagementPreheatPanelUsesAuthFilesSelection(t *testing.T) {
 	if !strings.Contains(script, `querySelectorAll("input[type='checkbox']")`) {
 		t.Fatalf("preheat script should sync existing auth-files page rows")
 	}
-	if !strings.Contains(script, `preheatSelectedWithInterval(selected)`) {
-		t.Fatalf("preheat script should preheat every selected credential with spacing")
+	if !strings.Contains(script, `startPreheatJob("preheat", selected)`) {
+		t.Fatalf("preheat script should start one backend preheat job for selected credentials")
 	}
 	if !strings.Contains(script, `预热选中账号`) {
 		t.Fatalf("preheat script should add a preheat-selected action on the auth-files page")
@@ -302,190 +305,156 @@ func TestManagementPreheatPanelRendersRefreshTimeControls(t *testing.T) {
 	}
 }
 
-func TestManagementPreheatPanelFetchesCodexRefreshTimeThroughAPICall(t *testing.T) {
+func TestManagementPreheatPanelUsesBackendPreheatJobs(t *testing.T) {
 	script := managementPreheatScript
 	for _, token := range []string{
-		`var apiCallEndpoint = "/v0/management/api-call"`,
-		`https://chatgpt.com/backend-api/wham/usage`,
-		`Authorization: "Bearer $TOKEN$"`,
-		`Chatgpt-Account-Id`,
-		`function fetchRefreshTimeForAuthFile`,
-		`method: "GET"`,
-		`url: codexUsageEndpoint`,
+		`var preheatJobEndpoint = "/v0/management/auth-files/preheat/jobs"`,
+		`function startPreheatJob`,
+		`function pollPreheatJob`,
+		`body: JSON.stringify({ operation: operation, auth_indices: indexes })`,
+		`preheatJobEndpoint + "/" + encodeURIComponent(jobID)`,
+		`function terminalPreheatJobStatus`,
+		`state.jobPollTimer = window.setTimeout(function () { pollPreheatJob(jobID, operation); }, jobPollIntervalMs)`,
 	} {
 		if !strings.Contains(script, token) {
-			t.Fatalf("preheat script should fetch structured Codex quota through management api-call; missing %q", token)
+			t.Fatalf("preheat script should use backend job token %q", token)
 		}
 	}
-	if strings.Contains(script, `codex_quota.reset_hint`) || strings.Contains(script, `周限额`) {
-		t.Fatalf("preheat script must not parse localized quota display strings")
+	for _, token := range []string{
+		`/v0/management/api-call`,
+		`https://chatgpt.com/backend-api/wham/usage`,
+		`Authorization: "Bearer $TOKEN$"`,
+		`function fetchRefreshTimeForAuthFile`,
+		`function persistRefreshStateForAuthFile`,
+		`authFileFieldsEndpoint`,
+		`preheatSelectedWithInterval`,
+		`fetchRefreshTimesWithInterval`,
+		`preheatAndRefreshWithInterval`,
+		`autoPreheatLoop`,
+	} {
+		if strings.Contains(script, token) {
+			t.Fatalf("preheat script should not contain browser-owned long-work token %q", token)
+		}
 	}
 }
 
-func TestManagementPreheatPanelNormalizesRefreshTimeState(t *testing.T) {
+func TestManagementPreheatPanelReadsBackendRefreshTimeState(t *testing.T) {
 	script := managementPreheatScript
 	for _, token := range []string{
+		`function normalizeStoredRefreshState`,
 		`fetched_refresh_time`,
 		`exact_seven_day_refresh`,
 		`preheat_needed`,
 		`weekly_reset_at`,
-		`var monthlyWindowSeconds = [2419200, 2505600, 2592000, 2678400]`,
-		`var quotaResetWindowSeconds = monthlyWindowSeconds`,
+		`function rememberAuthFile`,
+		`function knownCodexAuthFiles`,
+		`var nextAuthFilesByIndex = {}`,
+		`var nextRefreshTimes = {}`,
+		`state.authFilesByIndex = nextAuthFilesByIndex`,
+		`state.refreshTimes = nextRefreshTimes`,
+	} {
+		if !strings.Contains(script, token) {
+			t.Fatalf("preheat script missing backend refresh-state display token %q", token)
+		}
+	}
+	for _, token := range []string{
+		`var monthlyWindowSeconds`,
+		`var quotaResetWindowSeconds`,
 		`function firstDefinedValue`,
 		`function apiCallBodyOf`,
 		`function isQuotaResetWindowSeconds`,
 		`function rateLimitCandidatesOf`,
-		`function appendRateLimitCandidate`,
 		`function quotaResetWindowOf`,
-		`return { window: windowValue, seconds: seconds }`,
-		`var quotaWindowSeconds = quotaWindow.seconds`,
-		`var quotaWindowValue = quotaWindow.window`,
-		`Math.round(resetAfter) === quotaWindowSeconds`,
-		`Math.round(resetAtDelta) === quotaWindowSeconds`,
-		`var authFileFieldsEndpoint = "/v0/management/auth-files/fields"`,
 		`function refreshStatePayload`,
-		`function persistRefreshStateForAuthFile`,
-		`state.refreshTimes = nextRefreshTimes`,
-		`body: JSON.stringify(payload)`,
 		`limit_window_seconds`,
-		`limitWindowSeconds`,
 		`reset_after_seconds`,
-		`resetAfterSeconds`,
-		`reset_at`,
-		`resetAt`,
-		`additional_rate_limits`,
-		`additionalRateLimits`,
-		`code_review_rate_limits`,
-		`codeReviewRateLimits`,
 		`body_text`,
-		`bodyText`,
-		`未找到可识别的月限额刷新时间`,
-	} {
-		if !strings.Contains(script, token) {
-			t.Fatalf("preheat script missing normalized refresh-time token %q", token)
-		}
-	}
-	for _, token := range []string{
-		`refreshStateStorageKey`,
-		`function loadRefreshState`,
-		`function saveRefreshState`,
-		`localStorage.setItem(refreshStateStorageKey`,
-		`localStorage.getItem(refreshStateStorageKey`,
-		`isQuotaResetWindowSeconds(resetAfter)`,
-		`isQuotaResetWindowSeconds(resetAtDelta)`,
-		`legacyWeeklyWindowSeconds`,
 		`604` + `800`,
 		`delete state.refreshTimes[index]`,
-		`data.body || data.bodyText`,
 	} {
 		if strings.Contains(script, token) {
-			t.Fatalf("preheat script should not contain stale refresh-time token %q", token)
+			t.Fatalf("preheat script should not contain backend-owned refresh parser token %q", token)
 		}
 	}
 }
 
-func TestManagementPreheatPanelFetchesSelectedRefreshTimesSequentially(t *testing.T) {
+func TestManagementPreheatPanelFetchesSelectedRefreshTimesThroughBackendJob(t *testing.T) {
 	script := managementPreheatScript
 	if !strings.Contains(script, `function fetchSelectedRefreshTimes`) {
 		t.Fatalf("preheat script should expose a selected refresh-time fetch action")
 	}
-	if !strings.Contains(script, `fetchRefreshTimesWithInterval(selected)`) {
-		t.Fatalf("selected refresh-time fetch should use the sequential helper")
+	if !strings.Contains(script, `startPreheatJob("refresh_time", selected)`) {
+		t.Fatalf("selected refresh-time fetch should start one backend refresh_time job")
 	}
-	if !strings.Contains(script, `function fetchRefreshTimesWithInterval`) {
-		t.Fatalf("preheat script should define a refresh-time sequential helper")
-	}
-	if !strings.Contains(script, `return sleep(preheatIntervalMs).then(function () { return fetchRefreshTimeForAuthFile(file); })`) {
-		t.Fatalf("refresh-time fetch should wait 1s between selected credentials")
-	}
-	if strings.Contains(script, `Promise.all(selected.map(fetchRefreshTimeForAuthFile))`) {
-		t.Fatalf("refresh-time fetch must not run selected credentials concurrently")
+	for _, token := range []string{
+		`function fetchRefreshTimesWithInterval`,
+		`return sleep(preheatIntervalMs).then(function () { return fetchRefreshTimeForAuthFile(file); })`,
+		`Promise.all(selected.map(fetchRefreshTimeForAuthFile))`,
+	} {
+		if strings.Contains(script, token) {
+			t.Fatalf("refresh-time fetch should not be browser-owned; found %q", token)
+		}
 	}
 }
 
-func TestManagementPreheatPanelAutoPreheatUsesNearestQuotaResetLoop(t *testing.T) {
+func TestManagementPreheatPanelAutoPreheatUsesBackendStatus(t *testing.T) {
 	script := managementPreheatScript
+	for _, token := range []string{
+		`var preheatAutoEndpoint = "/v0/management/auth-files/preheat/auto"`,
+		`function ensureAutoStatus`,
+		`function fetchPreheatAutoStatus`,
+		`function pollPreheatAutoStatus`,
+		`function toggleAutoPreheat`,
+		`method: "PATCH"`,
+		`body: JSON.stringify({ enabled: enable })`,
+		`method: "GET"`,
+		`state.autoRunning = data.enabled === true`,
+		`state.autoPollTimer = window.setTimeout(function ()`,
+	} {
+		if !strings.Contains(script, token) {
+			t.Fatalf("preheat script missing backend auto token %q", token)
+		}
+	}
 	for _, token := range []string{
 		`function autoPreheatLoop`,
 		`function sortResetAuthFiles`,
 		`var dueScheduled = scheduled.filter`,
-		`var due = exact.concat(dueScheduled)`,
-		`var next = scheduled[0]`,
-		`Date.now()`,
-		`var autoPreheatLoopIntervalMs = 60000`,
-		`if (action === "continue") return sleep(autoPreheatLoopIntervalMs).then(autoPreheatLoop)`,
-		`return sleep(autoPreheatLoopIntervalMs).then(autoPreheatLoop)`,
-		`function exactRefreshAuthFiles`,
 		`preheatAndRefreshWithInterval(due)`,
+		`sleep(autoPreheatLoopIntervalMs).then(autoPreheatLoop)`,
 	} {
-		if !strings.Contains(script, token) {
-			t.Fatalf("preheat script missing auto loop token %q", token)
+		if strings.Contains(script, token) {
+			t.Fatalf("auto preheat should be backend-owned; found %q", token)
 		}
-	}
-	if strings.Contains(script, `Promise.all(exact.map`) || strings.Contains(script, `Promise.all(scheduled.map`) {
-		t.Fatalf("auto preheat should not process credentials concurrently")
-	}
-	if strings.Contains(script, `if (action === "continue") return autoPreheatLoop()`) {
-		t.Fatalf("auto preheat should wait before continuing after a due credential")
-	}
-	if strings.Contains(script, `preheatAndRefreshAuthFile(next)`) {
-		t.Fatalf("auto preheat should batch all due scheduled credentials, not process only scheduled[0]")
-	}
-	if strings.Contains(script, `return sleep(preheatIntervalMs).then(autoPreheatLoop)`) {
-		t.Fatalf("auto preheat loop should use the 60s loop interval, not the per-credential interval")
 	}
 }
 
-func TestManagementPreheatPanelAutoPreheatEnablesDisabledAuthBeforePreheatAndRefresh(t *testing.T) {
+func TestManagementPreheatPanelBackendOwnsAutoEnableAndDisabledSkip(t *testing.T) {
 	script := managementPreheatScript
 	for _, token := range []string{
-		`var authFileStatusEndpoint = "/v0/management/auth-files/status"`,
+		`authFileStatusEndpoint`,
 		`function isDisabledAuthFile`,
 		`function authStatusNameOf`,
 		`function setAuthFileDisabled`,
 		`function enableAuthFileForPreheat`,
-		`method: "PATCH"`,
-		`body: JSON.stringify({ name: name, disabled: disabled })`,
 		`setAuthFileDisabled(file, false)`,
-		`refreshAuthFilesSoon(250)`,
-	} {
-		if !strings.Contains(script, token) {
-			t.Fatalf("preheat script missing disabled auth auto-enable token %q", token)
-		}
-	}
-
-	ordered := `return enableAuthFileForPreheat(file).then(function () { return preheatAuthFile(file); }).then(function () { return fetchRefreshTimeForAuthFile(file); });`
-	if !strings.Contains(script, ordered) {
-		t.Fatalf("auto preheat should enable disabled auth before preheating and refreshing")
-	}
-	if strings.Contains(script, `return preheatAuthFile(file).then(function () { return fetchRefreshTimeForAuthFile(file); });`) {
-		t.Fatalf("auto preheat should not bypass disabled auth enablement")
-	}
-}
-
-func TestManagementPreheatPanelAutoPreheatSkipsManualDisabledAuth(t *testing.T) {
-	script := managementPreheatScript
-	for _, token := range []string{
 		`function isAutoQuotaDisabledAuthFile`,
 		`function canAutoPreheatAuthFile`,
 		`quota_auto_disabled`,
-		`if (!isAutoQuotaDisabledAuthFile(file)) return Promise.reject`,
-		`canAutoPreheatAuthFile(file) && refresh.fetched_refresh_time`,
 	} {
-		if !strings.Contains(script, token) {
-			t.Fatalf("preheat script missing manual-disabled guard token %q", token)
+		if strings.Contains(script, token) {
+			t.Fatalf("backend should own auto enable/disabled skip behavior; found %q", token)
 		}
 	}
 }
 
-func TestManagementPreheatPanelBlocksManualActionsDuringAutoPreheat(t *testing.T) {
+func TestManagementPreheatPanelBlocksManualActionsDuringBackendWork(t *testing.T) {
 	script := managementPreheatScript
-	if !strings.Contains(script, `var manualBusy = state.loading || state.autoRunning || state.autoBusy || !originalFetch`) {
-		t.Fatalf("manual controls should be disabled while auto preheat owns credential operations")
+	if !strings.Contains(script, `var manualBusy = state.loading || state.autoBusy || !originalFetch`) {
+		t.Fatalf("manual controls should be disabled while backend work is active")
 	}
-	guard := `if (state.loading || state.autoRunning || state.autoBusy || !originalFetch) return;`
+	guard := `if (state.loading || state.autoBusy || !originalFetch) return;`
 	if strings.Count(script, guard) < 2 {
-		t.Fatalf("manual preheat and refresh-time fetch handlers should return while auto preheat is active")
+		t.Fatalf("manual preheat and refresh-time fetch handlers should return while backend work is active")
 	}
 }
 
@@ -500,49 +469,80 @@ func TestManagementPreheatPanelNoLongerUsesStaticRefreshIntervalAuthMetadata(t *
 
 func TestManagementPreheatPanelRetainsSelectionAcrossPages(t *testing.T) {
 	script := managementPreheatScript
-	if !strings.Contains(script, `selectedAuthFiles: {}`) {
-		t.Fatalf("preheat script should retain selected Codex credentials outside the current page DOM")
-	}
-	if !strings.Contains(script, `function syncSelectedCodexAuthFiles`) {
-		t.Fatalf("preheat script should sync page selections into retained selection state")
-	}
-	if !strings.Contains(script, `state.selectedAuthFiles[index] = file`) {
-		t.Fatalf("preheat script should remember checked credentials by auth index")
-	}
-	if !strings.Contains(script, `delete state.selectedAuthFiles[index]`) {
-		t.Fatalf("preheat script should remove unchecked credentials from retained selection state")
-	}
-	if !strings.Contains(script, `Object.keys(state.selectedAuthFiles).map`) {
-		t.Fatalf("preheat script should preheat retained selections across auth-files pages")
+	for _, token := range []string{
+		`authFilesByIndex: {}`,
+		`selectedAuthFiles: {}`,
+		`function syncSelectedCodexAuthFiles`,
+		`function knownCodexAuthFiles`,
+		`var nextSelectedAuthFiles = {}`,
+		`nextAuthFilesByIndex[index] = file`,
+		`if (nextAuthFilesByIndex[index]) nextSelectedAuthFiles[index] = nextAuthFilesByIndex[index]`,
+		`state.selectedAuthFiles = nextSelectedAuthFiles`,
+		`state.selectedAuthFiles[index] = state.authFilesByIndex[index] || file`,
+		`return state.authFilesByIndex[index] || state.selectedAuthFiles[index]`,
+		`Object.keys(state.selectedAuthFiles).map`,
+		`delete state.selectedAuthFiles[index]`,
+	} {
+		if !strings.Contains(script, token) {
+			t.Fatalf("preheat script should retain selected Codex credentials across pages; missing %q", token)
+		}
 	}
 }
 
-func TestManagementPreheatPanelPreheatsSequentiallyWithDelay(t *testing.T) {
+func TestManagementPreheatPanelReconcilesObservedAuthFiles(t *testing.T) {
 	script := managementPreheatScript
-	if !strings.Contains(script, `var preheatIntervalMs = 1000`) {
-		t.Fatalf("preheat script should define a per-credential preheat interval")
+	for _, token := range []string{
+		`var nextAuthFilesByIndex = {}`,
+		`var nextRefreshTimes = {}`,
+		`var nextSelectedAuthFiles = {}`,
+		`nextAuthFilesByIndex[index] = file`,
+		`if (normalized && normalized.fetched_refresh_time) nextRefreshTimes[index] = normalized`,
+		`if (nextAuthFilesByIndex[index]) nextSelectedAuthFiles[index] = nextAuthFilesByIndex[index]`,
+		`state.authFilesByIndex = nextAuthFilesByIndex`,
+		`state.refreshTimes = nextRefreshTimes`,
+		`state.selectedAuthFiles = nextSelectedAuthFiles`,
+	} {
+		if !strings.Contains(script, token) {
+			t.Fatalf("preheat script should reconcile auth-file, refresh-time, and selection caches from the latest auth-files response; missing %q", token)
+		}
 	}
-	if !strings.Contains(script, `function sleep(ms)`) {
-		t.Fatalf("preheat script should provide a delay helper for sequential preheating")
+	if strings.Contains(script, `delete state.refreshTimes[index]`) {
+		t.Fatalf("preheat script should reconcile refresh state by replacing the observed refresh map, not ad-hoc deletes")
 	}
-	if !strings.Contains(script, `function preheatSelectedWithInterval`) {
-		t.Fatalf("preheat script should preheat selected credentials sequentially")
+}
+
+func TestManagementPreheatPanelStartsSelectedPreheatJobWithoutBrowserDelay(t *testing.T) {
+	script := managementPreheatScript
+	if !strings.Contains(script, `startPreheatJob("preheat", selected)`) {
+		t.Fatalf("preheat script should start a backend job for selected credentials")
 	}
-	if strings.Contains(script, `Promise.all(selected.map(preheatAuthFile))`) {
-		t.Fatalf("preheat script should not preheat all selected credentials concurrently")
-	}
-	if !strings.Contains(script, `return sleep(preheatIntervalMs)`) {
-		t.Fatalf("preheat script should wait between credential preheat requests")
+	for _, token := range []string{
+		`var preheatIntervalMs = 1000`,
+		`function sleep(ms)`,
+		`function preheatSelectedWithInterval`,
+		`return sleep(preheatIntervalMs)`,
+		`Promise.all(selected.map(preheatAuthFile))`,
+	} {
+		if strings.Contains(script, token) {
+			t.Fatalf("preheat script should not own per-credential preheat delay; found %q", token)
+		}
 	}
 }
 
 func TestManagementPreheatPanelWalksSelectionAncestors(t *testing.T) {
 	script := managementPreheatScript
-	if !strings.Contains(script, `function fileForCheckbox`) {
-		t.Fatalf("preheat script should resolve selected files from nested auth-files checkbox ancestors")
-	}
-	if !strings.Contains(script, `while (node && node !== document.body)`) {
-		t.Fatalf("preheat script should walk ancestors until it finds the credential card text")
+	for _, token := range []string{
+		`function fileForCheckbox`,
+		`function authContainerForCheckbox`,
+		`while (node && node !== document.body)`,
+		`className.indexOf("fileCard") !== -1`,
+		`className.indexOf("fileCardLayout") === -1`,
+		`className.indexOf("fileCardMain") === -1`,
+		`return authContainerForCheckbox(checkbox, fileForCheckbox(checkbox))`,
+	} {
+		if !strings.Contains(script, token) {
+			t.Fatalf("preheat script should resolve and hide whole credential cards; missing %q", token)
+		}
 	}
 }
 

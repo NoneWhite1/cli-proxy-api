@@ -9,19 +9,13 @@ const managementPreheatScript = `<script>
         if (window.__cliproxyCodexPreheat) return;
         window.__cliproxyCodexPreheat = true;
 
-        var preheatEndpoint = "/v0/management/auth-files/preheat";
         var authFilesEndpoint = "/v0/management/auth-files";
-        var authFileStatusEndpoint = "/v0/management/auth-files/status";
-        var authFileFieldsEndpoint = "/v0/management/auth-files/fields";
-        var apiCallEndpoint = "/v0/management/api-call";
-        var codexUsageEndpoint = "https://chatgpt.com/backend-api/wham/usage";
-        var codexUsageUserAgent = "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal";
+        var preheatJobEndpoint = "/v0/management/auth-files/preheat/jobs";
+        var preheatAutoEndpoint = "/v0/management/auth-files/preheat/auto";
         var originalFetch = window.fetch ? window.fetch.bind(window) : null;
-        var preheatIntervalMs = 1000;
-        var autoPreheatLoopIntervalMs = 60000;
-        var monthlyWindowSeconds = [2419200, 2505600, 2592000, 2678400];
-        var quotaResetWindowSeconds = monthlyWindowSeconds;
-        var state = { files: [], selectedAuthFiles: {}, refreshTimes: {}, showOnlyNoRefreshTime: false, autoRunning: false, autoBusy: false, loading: false, message: "", messageType: "muted", authHeaders: {} };
+        var jobPollIntervalMs = 1000;
+        var autoStatusPollIntervalMs = 5000;
+        var state = { files: [], authFilesByIndex: {}, selectedAuthFiles: {}, refreshTimes: {}, showOnlyNoRefreshTime: false, autoRunning: false, autoBusy: false, autoStatusLoaded: false, loading: false, message: "", messageType: "muted", authHeaders: {}, jobPollTimer: null, autoPollTimer: null };
         var renderTimer = null;
         var refreshTimer = null;
         var suppressObserver = false;
@@ -86,24 +80,54 @@ const managementPreheatScript = `<script>
 
         function parseAuthFiles(data) {
           var files = Array.isArray(data) ? data : data && Array.isArray(data.files) ? data.files : [];
-          state.files = files.filter(function (file) {
-            var provider = String((file && (file.provider || file.type)) || "").trim().toLowerCase();
-            return provider === "codex" && authIndexOf(file);
-          });
+          var nextAuthFilesByIndex = {};
           var nextRefreshTimes = {};
+          state.files = files.filter(isCodexAuthFile);
           state.files.forEach(function (file) {
             var index = authIndexOf(file);
+            nextAuthFilesByIndex[index] = file;
             var normalized = normalizeStoredRefreshState(file);
             if (normalized && normalized.fetched_refresh_time) nextRefreshTimes[index] = normalized;
-            if (index && state.selectedAuthFiles[index]) state.selectedAuthFiles[index] = file;
           });
+          var nextSelectedAuthFiles = {};
+          Object.keys(state.selectedAuthFiles).forEach(function (index) {
+            if (nextAuthFilesByIndex[index]) nextSelectedAuthFiles[index] = nextAuthFilesByIndex[index];
+          });
+          state.authFilesByIndex = nextAuthFilesByIndex;
           state.refreshTimes = nextRefreshTimes;
+          state.selectedAuthFiles = nextSelectedAuthFiles;
           scheduleRender();
           return state.files;
         }
 
         function authIndexOf(file) {
           return String((file && (file.auth_index || file.authIndex || file["auth-index"])) || "").trim();
+        }
+
+        function isCodexAuthFile(file) {
+          var provider = String((file && (file.provider || file.type)) || "").trim().toLowerCase();
+          return provider === "codex" && authIndexOf(file);
+        }
+
+        function rememberAuthFile(file) {
+          var index = authIndexOf(file);
+          if (!index) return null;
+          state.authFilesByIndex[index] = file;
+          return file;
+        }
+
+        function knownCodexAuthFiles() {
+          var seen = {};
+          var files = [];
+          function add(file) {
+            var index = authIndexOf(file);
+            if (!index || seen[index] || !isCodexAuthFile(file)) return;
+            seen[index] = true;
+            files.push(file);
+          }
+          state.files.forEach(add);
+          Object.keys(state.authFilesByIndex).forEach(function (index) { add(state.authFilesByIndex[index]); });
+          return files;
         }
 
         function labelOf(file) {
@@ -202,6 +226,7 @@ const managementPreheatScript = `<script>
             restoreHiddenAuthRows();
             return;
           }
+          ensureAutoStatus();
           ensureStyle();
           var host = findHost();
           if (!host) return;
@@ -211,7 +236,7 @@ const managementPreheatScript = `<script>
           }
 
           var counts = refreshCounts();
-          var manualBusy = state.loading || state.autoRunning || state.autoBusy || !originalFetch;
+          var manualBusy = state.loading || state.autoBusy || !originalFetch;
           var manualDisabled = manualBusy ? " disabled" : "";
           var autoDisabled = !originalFetch || (state.loading && !state.autoRunning) ? " disabled" : "";
           var togglePressed = state.showOnlyNoRefreshTime ? ' aria-pressed="true"' : ' aria-pressed="false"';
@@ -249,12 +274,16 @@ const managementPreheatScript = `<script>
           if (refreshTimer) window.clearTimeout(refreshTimer);
           refreshTimer = window.setTimeout(function () {
             refreshTimer = null;
-            scheduleRender();
+            if (!originalFetch) {
+              scheduleRender();
+              return;
+            }
+            loadAuthFilesForPreheat().then(function () { scheduleRender(); }).catch(function () { scheduleRender(); });
           }, delay || 250);
         }
 
         function fileForNode(node) {
-          return state.files.find(function (candidate) { return rowTextMatchesFile(node, candidate); }) || null;
+          return knownCodexAuthFiles().find(function (candidate) { return rowTextMatchesFile(node, candidate); }) || null;
         }
 
         function rowTextMatchesFile(row, file) {
@@ -267,7 +296,7 @@ const managementPreheatScript = `<script>
 
         function selectedCodexAuthFiles() {
           syncSelectedCodexAuthFiles();
-          return Object.keys(state.selectedAuthFiles).map(function (index) { return state.selectedAuthFiles[index]; }).filter(function (file) { return file && authIndexOf(file); });
+          return Object.keys(state.selectedAuthFiles).map(function (index) { return state.authFilesByIndex[index] || state.selectedAuthFiles[index]; }).filter(function (file) { return file && authIndexOf(file); });
         }
 
         function handleSelectionChange(event) {
@@ -290,8 +319,9 @@ const managementPreheatScript = `<script>
             var index = authIndexOf(file);
             if (!index) return;
             if (checkbox.checked) {
-              state.selectedAuthFiles[index] = file;
-              if (!selected.some(function (item) { return authIndexOf(item) === index; })) selected.push(file);
+              rememberAuthFile(file);
+              state.selectedAuthFiles[index] = state.authFilesByIndex[index] || file;
+              if (!selected.some(function (item) { return authIndexOf(item) === index; })) selected.push(state.selectedAuthFiles[index]);
             } else {
               delete state.selectedAuthFiles[index];
             }
@@ -315,16 +345,23 @@ const managementPreheatScript = `<script>
           return null;
         }
 
-        function authRowForCheckbox(checkbox) {
-          var file = fileForCheckbox(checkbox);
+        function authContainerForCheckbox(checkbox, file) {
           var node = checkbox;
-          var depth = 0;
-          while (node && node !== document.body && depth < 8) {
-            if (file && rowTextMatchesFile(node, file)) return node;
+          var fallback = null;
+          while (node && node !== document.body) {
+            var tag = String(node.tagName || "").toLowerCase();
+            var className = String(node.className || "");
+            var isCard = className.indexOf("fileCard") !== -1 && className.indexOf("fileCardLayout") === -1 && className.indexOf("fileCardMain") === -1;
+            var isRow = tag === "tr" || tag === "li";
+            if ((isCard || isRow) && (!file || rowTextMatchesFile(node, file))) return node;
+            if (!fallback && file && rowTextMatchesFile(node, file)) fallback = node;
             node = node.parentElement;
-            depth++;
           }
-          return checkbox.closest("tr") || checkbox.closest("li") || checkbox.closest("div");
+          return fallback || checkbox.closest("tr") || checkbox.closest("li") || checkbox.closest("div");
+        }
+
+        function authRowForCheckbox(checkbox) {
+          return authContainerForCheckbox(checkbox, fileForCheckbox(checkbox));
         }
 
         function updateAuthRowDecorations() {
@@ -334,6 +371,8 @@ const managementPreheatScript = `<script>
             var file = fileForCheckbox(checkbox);
             var row = authRowForCheckbox(checkbox);
             if (!file || !row) return;
+            var index = authIndexOf(file);
+            if (index && state.selectedAuthFiles[index] && !checkbox.checked) checkbox.checked = true;
             var refresh = refreshStateFor(file);
             var badge = row.querySelector(".codex-preheat-row-badge");
             if (!badge) {
@@ -383,7 +422,7 @@ const managementPreheatScript = `<script>
 
         function refreshCounts() {
           var counts = { missing: 0, fetched: 0, ready: 0, scheduled: 0 };
-          state.files.forEach(function (file) {
+          knownCodexAuthFiles().forEach(function (file) {
             var refresh = refreshStateFor(file);
             if (!refresh.fetched_refresh_time) {
               counts.missing++;
@@ -396,372 +435,182 @@ const managementPreheatScript = `<script>
           return counts;
         }
 
-        function preheatAuthFile(file) {
-          return originalFetch(preheatEndpoint, {
-            method: "POST",
-            headers: authHeaders(),
-            body: JSON.stringify({ auth_index: authIndexOf(file) })
-          }).then(function (response) {
-            return response.text().then(function (text) {
-              var data = {};
-              try { data = text ? JSON.parse(text) : {}; } catch (_) { data = {}; }
-              if (!response.ok) throw new Error(data.message || data.error || text || "预热失败");
-              return data;
-            });
-          });
-        }
-
         function loadAuthFilesForPreheat() {
-          return originalFetch(authFilesEndpoint, {
-            method: "GET",
-            headers: authHeaders()
-          }).then(function (response) {
+          return jsonRequest(authFilesEndpoint, { method: "GET", headers: authHeaders() }, "加载凭证失败").then(function (data) {
+            parseAuthFiles(data);
+            return knownCodexAuthFiles();
+          });
+        }
+
+        function jsonRequest(endpoint, init, fallbackMessage) {
+          return originalFetch(endpoint, init || {}).then(function (response) {
             return response.text().then(function (text) {
               var data = {};
               try { data = text ? JSON.parse(text) : {}; } catch (_) { data = {}; }
-              if (!response.ok) throw new Error(data.message || data.error || text || "加载凭证失败");
-              return parseAuthFiles(data);
+              if (!response.ok) throw new Error(data.message || data.error || text || fallbackMessage || "请求失败");
+              return data;
             });
           });
         }
 
-        function managementAPICall(payload) {
-          return originalFetch(apiCallEndpoint, {
+        function selectedAuthIndexes(files) {
+          var seen = {};
+          var indexes = [];
+          files.forEach(function (file) {
+            var index = authIndexOf(file);
+            if (!index || seen[index]) return;
+            seen[index] = true;
+            indexes.push(index);
+          });
+          return indexes;
+        }
+
+        function startPreheatJob(operation, files) {
+          var indexes = selectedAuthIndexes(files);
+          if (!indexes.length) return Promise.reject(new Error("请先勾选 Codex 凭证"));
+          state.loading = true;
+          state.messageType = "muted";
+          state.message = operation === "refresh_time" ? "已提交后台刷新时间任务" : "已提交后台预热任务";
+          scheduleRender();
+          return jsonRequest(preheatJobEndpoint, {
             method: "POST",
             headers: authHeaders(),
-            body: JSON.stringify(payload)
-          }).then(function (response) {
-            return response.text().then(function (text) {
-              var data = {};
-              try { data = text ? JSON.parse(text) : {}; } catch (_) { data = {}; }
-              if (!response.ok) throw new Error(data.message || data.error || text || "接口调用失败");
-              return data;
-            });
+            body: JSON.stringify({ operation: operation, auth_indices: indexes })
+          }, "启动后台任务失败").then(function (job) {
+            pollPreheatJob(job.job_id, operation);
+            return job;
+          }).catch(function (error) {
+            state.loading = false;
+            state.messageType = "error";
+            state.message = error && error.message ? error.message : "启动后台任务失败";
+            scheduleRender();
           });
         }
 
-        function sleep(ms) {
-          return new Promise(function (resolve) { window.setTimeout(resolve, ms); });
-        }
-
-        function preheatSelectedWithInterval(selected) {
-          var chain = Promise.resolve();
-          selected.forEach(function (file, index) {
-            chain = chain.then(function () {
-              if (index > 0) return sleep(preheatIntervalMs).then(function () { return preheatAuthFile(file); });
-              return preheatAuthFile(file);
-            });
-          });
-          return chain;
-        }
-
-        function fetchRefreshTimesWithInterval(selected) {
-          var chain = Promise.resolve();
-          selected.forEach(function (file, index) {
-            chain = chain.then(function () {
-              if (index > 0) return sleep(preheatIntervalMs).then(function () { return fetchRefreshTimeForAuthFile(file); });
-              return fetchRefreshTimeForAuthFile(file);
-            });
-          });
-          return chain;
-        }
-
-        function isDisabledAuthFile(file) {
-          return !!(file && (file.disabled === true || String(file.status || "").trim().toLowerCase() === "disabled"));
-        }
-
-        function isAutoQuotaDisabledAuthFile(file) {
-          return !!(file && (file.quota_auto_disabled === true || file.quotaAutoDisabled === true));
-        }
-
-        function canAutoPreheatAuthFile(file) {
-          return !isDisabledAuthFile(file) || isAutoQuotaDisabledAuthFile(file);
-        }
-
-        function authStatusNameOf(file) {
-          return String((file && (file.id || file.name || file.fileName || file.file_name)) || "").trim();
-        }
-
-        function setAuthFileDisabled(file, disabled) {
-          var name = authStatusNameOf(file);
-          if (!name) return Promise.reject(new Error("缺少凭证名称"));
-          return originalFetch(authFileStatusEndpoint, {
-            method: "PATCH",
-            headers: authHeaders(),
-            body: JSON.stringify({ name: name, disabled: disabled })
-          }).then(function (response) {
-            return response.text().then(function (text) {
-              var data = {};
-              try { data = text ? JSON.parse(text) : {}; } catch (_) { data = {}; }
-              if (!response.ok) throw new Error(data.message || data.error || text || "更新凭证状态失败");
-              file.disabled = disabled;
-              file.status = disabled ? "disabled" : "active";
-              refreshAuthFilesSoon(250);
-              return data;
-            });
-          });
-        }
-
-        function enableAuthFileForPreheat(file) {
-          if (!isDisabledAuthFile(file)) return Promise.resolve(file);
-          if (!isAutoQuotaDisabledAuthFile(file)) return Promise.reject(new Error("凭证已手动禁用，跳过自动预热"));
-          return setAuthFileDisabled(file, false).then(function () { return file; });
-        }
-
-        function preheatAndRefreshAuthFile(file) {
-          return enableAuthFileForPreheat(file).then(function () { return preheatAuthFile(file); }).then(function () { return fetchRefreshTimeForAuthFile(file); });
-        }
-
-        function preheatAndRefreshWithInterval(files) {
-          var chain = Promise.resolve();
-          files.forEach(function (file, index) {
-            chain = chain.then(function () {
-              if (index > 0) return sleep(preheatIntervalMs).then(function () { return preheatAndRefreshAuthFile(file); });
-              return preheatAndRefreshAuthFile(file);
-            });
-          });
-          return chain;
-        }
-
-        function numberValue(value) {
+        function countOf(job, key) {
+          var value = job && job[key];
           if (typeof value === "number" && isFinite(value)) return value;
-          if (typeof value === "string") {
-            var trimmed = value.trim();
-            if (!trimmed) return null;
-            var parsed = Number(trimmed);
-            if (isFinite(parsed)) return parsed;
-          }
-          return null;
+          var parsed = parseInt(String(value || "0"), 10);
+          return isNaN(parsed) ? 0 : parsed;
         }
 
-        function parseMaybeJSON(value) {
-          if (!value) return null;
-          if (typeof value === "object") return value;
-          if (typeof value !== "string") return null;
-          try {
-            return JSON.parse(value);
-          } catch (_) {
-            return null;
-          }
+        function terminalPreheatJobStatus(status) {
+          status = String(status || "").toLowerCase();
+          return status === "succeeded" || status === "failed" || status === "partial" || status === "completed" || status === "cancelled";
         }
 
-        function firstDefinedValue(object, keys) {
-          if (!object || typeof object !== "object") return undefined;
-          for (var i = 0; i < keys.length; i++) {
-            if (Object.prototype.hasOwnProperty.call(object, keys[i])) return object[keys[i]];
-          }
-          return undefined;
+        function actionLabel(operation) {
+          if (operation === "refresh_time") return "获取刷新时间";
+          if (operation === "preheat_refresh") return "预热并刷新时间";
+          return "预热";
         }
 
-        function apiCallBodyOf(data) {
-          return firstDefinedValue(data, ["body", "bodyText", "body_text"]);
+        function updateMessageFromJob(job, operation) {
+          var total = countOf(job, "total");
+          var completed = countOf(job, "completed");
+          var failed = countOf(job, "failed");
+          var deduped = countOf(job, "deduped");
+          var label = actionLabel(operation || (job && job.operation));
+          var suffix = "：" + completed + "/" + total;
+          if (failed) suffix += "，失败 " + failed;
+          if (deduped) suffix += "，跳过重复 " + deduped;
+          state.messageType = failed ? "error" : "muted";
+          state.message = "后台" + label + "处理中" + suffix;
         }
 
-        function base64URLDecode(value) {
-          try {
-            var normalized = String(value || "").replace(/-/g, "+").replace(/_/g, "/");
-            normalized = normalized + "====".slice(0, (4 - normalized.length % 4) % 4);
-            if (typeof window !== "undefined" && typeof window.atob === "function") return window.atob(normalized);
-            if (typeof atob === "function") return atob(normalized);
-          } catch (_) {
-            return "";
-          }
-          return "";
-        }
-
-        function objectFromJSONOrJWT(value) {
-          if (!value) return null;
-          if (typeof value === "object" && !Array.isArray(value)) return value;
-          if (typeof value !== "string") return null;
-          var trimmed = value.trim();
-          if (!trimmed) return null;
-          try {
-            var parsed = JSON.parse(trimmed);
-            if (parsed && typeof parsed === "object") return parsed;
-          } catch (_) {
-            // Fall through to JWT parsing.
-          }
-          var parts = trimmed.split(".");
-          if (parts.length < 2) return null;
-          try {
-            var decoded = base64URLDecode(parts[1]);
-            return decoded ? JSON.parse(decoded) : null;
-          } catch (_) {
-            return null;
+        function finishJobMessage(job, operation) {
+          var total = countOf(job, "total");
+          var completed = countOf(job, "completed");
+          var failed = countOf(job, "failed");
+          var deduped = countOf(job, "deduped");
+          var label = actionLabel(operation || (job && job.operation));
+          if (String(job && job.status).toLowerCase() === "failed" || failed >= total && total > 0) {
+            state.messageType = "error";
+            state.message = "后台" + label + "失败：" + failed + "/" + total;
+          } else if (failed > 0 || String(job && job.status).toLowerCase() === "partial") {
+            state.messageType = "error";
+            state.message = "后台" + label + "部分完成：成功 " + (completed - failed) + "，失败 " + failed + (deduped ? "，跳过重复 " + deduped : "");
+          } else {
+            state.messageType = "success";
+            state.message = "后台" + label + "已完成：" + completed + " 个" + (deduped ? "，跳过重复 " + deduped : "");
           }
         }
 
-        function chatGPTAccountIDFromValue(value) {
-          var obj = objectFromJSONOrJWT(value);
-          if (!obj) return "";
-          var nested = obj["https://api.openai.com/auth"];
-          return String(obj.chatgpt_account_id || obj.chatgptAccountId || (nested && (nested.chatgpt_account_id || nested.chatgptAccountId)) || "").trim();
-        }
-
-        function chatGPTAccountIDOf(file) {
-          var metadata = file && file.metadata && typeof file.metadata === "object" ? file.metadata : null;
-          var attributes = file && file.attributes && typeof file.attributes === "object" ? file.attributes : null;
-          var candidates = [file && file.id_token, file && file.idToken, metadata && metadata.id_token, metadata && metadata.idToken, attributes && attributes.id_token, attributes && attributes.idToken];
-          for (var i = 0; i < candidates.length; i++) {
-            var accountID = chatGPTAccountIDFromValue(candidates[i]);
-            if (accountID) return accountID;
+        function pollPreheatJob(jobID, operation) {
+          if (!jobID || !originalFetch) return Promise.resolve();
+          if (state.jobPollTimer) {
+            window.clearTimeout(state.jobPollTimer);
+            state.jobPollTimer = null;
           }
-          return "";
-        }
-
-        function isQuotaResetWindowSeconds(seconds) {
-          seconds = Math.round(seconds || 0);
-          return quotaResetWindowSeconds.indexOf(seconds) !== -1;
-        }
-
-        function appendRateLimitCandidate(candidates, rateLimit) {
-          if (rateLimit && typeof rateLimit === "object") candidates.push(rateLimit);
-        }
-
-        function rateLimitCandidatesOf(usage) {
-          var candidates = [];
-          if (!usage || typeof usage !== "object") return candidates;
-          appendRateLimitCandidate(candidates, usage.rate_limit || usage.rateLimit);
-          appendRateLimitCandidate(candidates, usage.code_review_rate_limit || usage.codeReviewRateLimit || usage.code_review_rate_limits || usage.codeReviewRateLimits);
-          var additional = usage.additional_rate_limits || usage.additionalRateLimits;
-          if (additional && !Array.isArray(additional)) additional = [additional];
-          (additional || []).forEach(function (item) {
-            appendRateLimitCandidate(candidates, item && (item.rate_limit || item.rateLimit));
-          });
-          return candidates;
-        }
-
-        function quotaResetWindowOf(usage) {
-          var rateLimits = rateLimitCandidatesOf(usage);
-          for (var i = 0; i < rateLimits.length; i++) {
-            var rateLimit = rateLimits[i];
-            if (!rateLimit || typeof rateLimit !== "object") continue;
-            var windows = [rateLimit.primary_window || rateLimit.primaryWindow || rateLimit.primary, rateLimit.secondary_window || rateLimit.secondaryWindow || rateLimit.secondary];
-            for (var j = 0; j < windows.length; j++) {
-              var windowValue = windows[j];
-              if (!windowValue || typeof windowValue !== "object") continue;
-              var seconds = numberValue(firstDefinedValue(windowValue, ["limit_window_seconds", "limitWindowSeconds"]));
-              seconds = Math.round(seconds || 0);
-              if (isQuotaResetWindowSeconds(seconds)) return { window: windowValue, seconds: seconds };
-            }
-          }
-          return null;
-        }
-
-        function normalizeCodexUsageRefreshState(usage) {
-          var quotaWindow = quotaResetWindowOf(usage);
-          if (!quotaWindow) return { fetched_refresh_time: false };
-          var quotaWindowSeconds = quotaWindow.seconds;
-          var quotaWindowValue = quotaWindow.window;
-          var now = Date.now();
-          var resetAfter = numberValue(firstDefinedValue(quotaWindowValue, ["reset_after_seconds", "resetAfterSeconds"]));
-          var resetAt = numberValue(firstDefinedValue(quotaWindowValue, ["reset_at", "resetAt"]));
-          var resetAtDelta = resetAt !== null && resetAt > 0 ? resetAt - Math.floor(now / 1000) : null;
-          var normalized = {
-            fetched_refresh_time: true,
-            fetched_at: new Date(now).toISOString(),
-            exact_seven_day_refresh: false,
-            preheat_needed: false
-          };
-          if ((resetAfter !== null && Math.round(resetAfter) === quotaWindowSeconds) || (resetAtDelta !== null && Math.round(resetAtDelta) === quotaWindowSeconds)) {
-            normalized.exact_seven_day_refresh = true;
-            normalized.preheat_needed = true;
-            return normalized;
-          }
-          var resetMs = 0;
-          if (resetAt !== null && resetAt > 0) resetMs = resetAt * 1000;
-          if (!resetMs && resetAfter !== null && resetAfter >= 0) resetMs = now + resetAfter * 1000;
-          if (!resetMs || isNaN(resetMs)) return { fetched_refresh_time: false };
-          normalized.weekly_reset_at = new Date(resetMs).toISOString();
-          return normalized;
-        }
-
-        function refreshStatePayload(normalized) {
-          normalized = normalized && typeof normalized === "object" ? normalized : { fetched_refresh_time: false };
-          return {
-            fetched_refresh_time: normalized.fetched_refresh_time === true,
-            exact_seven_day_refresh: normalized.exact_seven_day_refresh === true,
-            preheat_needed: normalized.preheat_needed === true,
-            weekly_reset_at: typeof normalized.weekly_reset_at === "string" ? normalized.weekly_reset_at : "",
-            fetched_at: typeof normalized.fetched_at === "string" ? normalized.fetched_at : ""
-          };
-        }
-
-        function persistRefreshStateForAuthFile(file, normalized) {
-          var name = authStatusNameOf(file);
-          if (!name) return Promise.reject(new Error("缺少凭证名称"));
-          var payload = refreshStatePayload(normalized);
-          payload.name = name;
-          return originalFetch(authFileFieldsEndpoint, {
-            method: "PATCH",
-            headers: authHeaders(),
-            body: JSON.stringify(payload)
-          }).then(function (response) {
-            return response.text().then(function (text) {
-              var data = {};
-              try { data = text ? JSON.parse(text) : {}; } catch (_) { data = {}; }
-              if (!response.ok) throw new Error(data.message || data.error || text || "保存刷新时间失败");
-              Object.keys(payload).forEach(function (key) {
-                if (key !== "name") file[key] = payload[key];
-              });
-              return normalized;
-            });
-          });
-        }
-
-        function fetchRefreshTimeForAuthFile(file) {
-          var index = authIndexOf(file);
-          if (!index) return Promise.reject(new Error("缺少 Codex 凭证索引"));
-          var headers = {
-            Authorization: "Bearer $TOKEN$",
-            "Content-Type": "application/json",
-            "User-Agent": codexUsageUserAgent
-          };
-          var accountID = chatGPTAccountIDOf(file);
-          if (accountID) headers["Chatgpt-Account-Id"] = accountID;
-          return managementAPICall({
-            authIndex: index,
-            method: "GET",
-            url: codexUsageEndpoint,
-            header: headers
-          }).then(function (data) {
-            var responseBody = apiCallBodyOf(data);
-            var statusCode = numberValue(firstDefinedValue(data, ["status_code", "statusCode"])) || 0;
-            if (statusCode < 200 || statusCode >= 300) throw new Error(String(responseBody || "获取刷新时间失败"));
-            var usage = parseMaybeJSON(responseBody);
-            if (!usage) throw new Error("解析 Codex 刷新时间失败");
-            var normalized = normalizeCodexUsageRefreshState(usage);
-            if (!normalized.fetched_refresh_time) {
-              throw new Error("未找到可识别的月限额刷新时间");
-            }
-            return persistRefreshStateForAuthFile(file, normalized).then(function () {
-              state.refreshTimes[index] = normalized;
+          return jsonRequest(preheatJobEndpoint + "/" + encodeURIComponent(jobID), { method: "GET", headers: authHeaders() }, "获取后台任务状态失败").then(function (job) {
+            if (terminalPreheatJobStatus(job.status)) {
+              state.loading = false;
+              finishJobMessage(job, operation);
+              refreshAuthFilesSoon(100);
               scheduleRender();
-              return normalized;
-            });
+              return job;
+            }
+            state.loading = true;
+            updateMessageFromJob(job, operation);
+            scheduleRender();
+            state.jobPollTimer = window.setTimeout(function () { pollPreheatJob(jobID, operation); }, jobPollIntervalMs);
+            return job;
+          }).catch(function (error) {
+            state.loading = false;
+            state.messageType = "error";
+            state.message = error && error.message ? error.message : "获取后台任务状态失败";
+            scheduleRender();
           });
         }
 
-        function exactRefreshAuthFiles(files) {
-          var candidates = Array.isArray(files) ? files : state.files;
-          return candidates.filter(function (file) {
-            var refresh = refreshStateFor(file);
-            return authIndexOf(file) && canAutoPreheatAuthFile(file) && refresh.fetched_refresh_time && refresh.exact_seven_day_refresh && refresh.preheat_needed;
+        function ensureAutoStatus() {
+          if (state.autoStatusLoaded || !originalFetch || !shouldShow()) return;
+          state.autoStatusLoaded = true;
+          fetchPreheatAutoStatus(true);
+        }
+
+        function applyAutoStatus(data, quiet) {
+          data = data && typeof data === "object" ? data : {};
+          state.autoRunning = data.enabled === true;
+          state.autoBusy = data.busy === true;
+          if (!quiet) {
+            if (state.autoRunning) {
+              state.messageType = "muted";
+              state.message = state.autoBusy ? "后端自动预热正在处理" : "后端自动预热已启动";
+            } else {
+              state.messageType = "muted";
+              state.message = "自动预热已停止";
+            }
+          }
+          scheduleRender();
+          if (state.autoRunning) pollPreheatAutoStatus();
+        }
+
+        function fetchPreheatAutoStatus(quiet) {
+          if (!originalFetch) return Promise.resolve();
+          return jsonRequest(preheatAutoEndpoint, { method: "GET", headers: authHeaders() }, "获取自动预热状态失败").then(function (data) {
+            applyAutoStatus(data, quiet);
+            return data;
+          }).catch(function (error) {
+            if (!quiet) {
+              state.messageType = "error";
+              state.message = error && error.message ? error.message : "获取自动预热状态失败";
+              scheduleRender();
+            }
           });
         }
 
-        function sortResetAuthFiles(files) {
-          var candidates = Array.isArray(files) ? files : state.files;
-          return candidates.filter(function (file) {
-            var refresh = refreshStateFor(file);
-            return authIndexOf(file) && canAutoPreheatAuthFile(file) && refresh.fetched_refresh_time && refresh.weekly_reset_at && !isNaN(Date.parse(refresh.weekly_reset_at));
-          }).sort(function (a, b) {
-            return Date.parse(refreshStateFor(a).weekly_reset_at) - Date.parse(refreshStateFor(b).weekly_reset_at);
-          });
+        function pollPreheatAutoStatus() {
+          if (state.autoPollTimer) window.clearTimeout(state.autoPollTimer);
+          if (!state.autoRunning || !originalFetch) return;
+          state.autoPollTimer = window.setTimeout(function () {
+            state.autoPollTimer = null;
+            fetchPreheatAutoStatus(true);
+          }, autoStatusPollIntervalMs);
         }
 
         function preheatSelected() {
-          if (state.loading || state.autoRunning || state.autoBusy || !originalFetch) return;
+          if (state.loading || state.autoBusy || !originalFetch) return;
           var selected = selectedCodexAuthFiles();
           if (!selected.length) {
             state.messageType = "error";
@@ -769,23 +618,11 @@ const managementPreheatScript = `<script>
             scheduleRender();
             return;
           }
-          state.loading = true;
-          state.message = "";
-          scheduleRender();
-          preheatSelectedWithInterval(selected).then(function () {
-            state.messageType = "success";
-            state.message = "已预热选中账号：" + selected.length + " 个";
-          }).catch(function (error) {
-            state.messageType = "error";
-            state.message = error && error.message ? error.message : "预热失败";
-          }).finally(function () {
-            state.loading = false;
-            scheduleRender();
-          });
+          startPreheatJob("preheat", selected);
         }
 
         function fetchSelectedRefreshTimes() {
-          if (state.loading || state.autoRunning || state.autoBusy || !originalFetch) return;
+          if (state.loading || state.autoBusy || !originalFetch) return;
           var selected = selectedCodexAuthFiles();
           if (!selected.length) {
             state.messageType = "error";
@@ -793,19 +630,7 @@ const managementPreheatScript = `<script>
             scheduleRender();
             return;
           }
-          state.loading = true;
-          state.message = "";
-          scheduleRender();
-          fetchRefreshTimesWithInterval(selected).then(function () {
-            state.messageType = "success";
-            state.message = "已获取选中刷新时间：" + selected.length + " 个";
-          }).catch(function (error) {
-            state.messageType = "error";
-            state.message = error && error.message ? error.message : "获取刷新时间失败";
-          }).finally(function () {
-            state.loading = false;
-            scheduleRender();
-          });
+          startPreheatJob("refresh_time", selected);
         }
 
         function toggleMissingRefreshTimeFilter() {
@@ -815,63 +640,31 @@ const managementPreheatScript = `<script>
         }
 
         function toggleAutoPreheat() {
-          if (state.autoRunning) {
-            state.autoRunning = false;
-            state.messageType = "muted";
-            state.message = "自动预热已停止";
-            scheduleRender();
-            return;
-          }
-          if (!originalFetch) return;
-          state.autoRunning = true;
-          state.messageType = "muted";
-          state.message = "自动预热已启动";
-          scheduleRender();
-          autoPreheatLoop();
-        }
-
-        function autoPreheatLoop() {
-          if (!state.autoRunning || state.autoBusy) return Promise.resolve();
+          if (!originalFetch || (state.loading && !state.autoRunning)) return;
+          var enable = !state.autoRunning;
           state.autoBusy = true;
-          return loadAuthFilesForPreheat().then(function (files) {
-            if (!state.autoRunning) return "stop";
-            var exact = exactRefreshAuthFiles(files);
-            var scheduled = sortResetAuthFiles(files);
-            var dueScheduled = scheduled.filter(function (file) {
-              var refresh = refreshStateFor(file);
-              var resetTime = Date.parse(refresh.weekly_reset_at);
-              return !isNaN(resetTime) && resetTime <= Date.now();
-            });
-            var due = exact.concat(dueScheduled);
-            if (due.length) {
-              state.messageType = "muted";
-              state.message = "正在处理已到达限额刷新时间的 Codex 账号：" + due.length + " 个";
-              scheduleRender();
-              return preheatAndRefreshWithInterval(due).then(function () { return "continue"; });
-            }
-            var next = scheduled[0];
-            if (!next) {
-              state.messageType = "muted";
-              state.message = "没有已获取限额刷新时间的 Codex 账号";
-              scheduleRender();
-              return "wait";
-            }
-            var refresh = refreshStateFor(next);
+          state.messageType = "muted";
+          state.message = enable ? "正在启动后端自动预热" : "正在停止后端自动预热";
+          scheduleRender();
+          return jsonRequest(preheatAutoEndpoint, {
+            method: "PATCH",
+            headers: authHeaders(),
+            body: JSON.stringify({ enabled: enable })
+          }, "更新自动预热状态失败").then(function (data) {
+            applyAutoStatus(data, true);
+            state.autoBusy = data && data.busy === true;
             state.messageType = "muted";
-            state.message = "等待最近限额刷新：" + labelOf(next) + " " + formatResetTime(refresh.weekly_reset_at);
+            state.message = enable ? "自动预热已在后端启动" : "自动预热已停止";
+            if (!enable && state.autoPollTimer) {
+              window.clearTimeout(state.autoPollTimer);
+              state.autoPollTimer = null;
+            }
+            refreshAuthFilesSoon(250);
             scheduleRender();
-            return "wait";
-          }).then(function (action) {
-            state.autoBusy = false;
-            scheduleRender();
-            if (!state.autoRunning) return undefined;
-            if (action === "continue") return sleep(autoPreheatLoopIntervalMs).then(autoPreheatLoop);
-            return sleep(autoPreheatLoopIntervalMs).then(autoPreheatLoop);
           }).catch(function (error) {
             state.autoBusy = false;
-            state.autoRunning = false;
             state.messageType = "error";
-            state.message = error && error.message ? error.message : "自动预热失败";
+            state.message = error && error.message ? error.message : "更新自动预热状态失败";
             scheduleRender();
           });
         }
