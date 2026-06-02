@@ -116,7 +116,7 @@ func (h *Handler) preheatCodexAuth(ctx context.Context, auth *coreauth.Auth) err
 		return fmt.Errorf("auth not found")
 	}
 	const model = "gpt-5.5"
-	payload := []byte(`{"model":"` + model + `","messages":[{"role":"user","content":"1"}],"stream":false}`)
+	payload := []byte(`{"model":"` + model + `","messages":[{"role":"user","content":"test"}],"stream":false}`)
 	_, errExecute := h.authManager.Execute(ctx, []string{"codex"}, cliproxyexecutor.Request{
 		Model:   model,
 		Payload: payload,

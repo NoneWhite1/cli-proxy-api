@@ -18,6 +18,9 @@ const managementPreheatScript = `<script>
         var state = { files: [], authFilesByIndex: {}, selectedAuthFiles: {}, refreshTimes: {}, showOnlyNoRefreshTime: false, autoRunning: false, autoBusy: false, autoStatusLoaded: false, loading: false, message: "", messageType: "muted", authHeaders: {}, jobPollTimer: null, autoPollTimer: null };
         var renderTimer = null;
         var refreshTimer = null;
+        var selectionSyncTimer = null;
+        var hostFilteredSelectionPending = false;
+        var hostSelectionClearPending = false;
         var suppressObserver = false;
 
         function methodOf(input, init) {
@@ -91,7 +94,11 @@ const managementPreheatScript = `<script>
           });
           var nextSelectedAuthFiles = {};
           Object.keys(state.selectedAuthFiles).forEach(function (index) {
-            if (nextAuthFilesByIndex[index]) nextSelectedAuthFiles[index] = nextAuthFilesByIndex[index];
+            var selected = nextAuthFilesByIndex[index] || state.authFilesByIndex[index] || state.selectedAuthFiles[index];
+            if (selected && isCodexAuthFile(selected)) {
+              nextAuthFilesByIndex[index] = nextAuthFilesByIndex[index] || selected;
+              nextSelectedAuthFiles[index] = nextAuthFilesByIndex[index];
+            }
           });
           state.authFilesByIndex = nextAuthFilesByIndex;
           state.refreshTimes = nextRefreshTimes;
@@ -191,6 +198,8 @@ const managementPreheatScript = `<script>
           window.fetch = trackFetch;
         }
         trackXHR();
+        document.addEventListener("click", handleSelectionChange, true);
+        document.addEventListener("input", handleSelectionChange, true);
         document.addEventListener("change", handleSelectionChange, true);
 
         function ensureStyle() {
@@ -294,6 +303,121 @@ const managementPreheatScript = `<script>
           });
         }
 
+        function readHostAuthFilesUIState() {
+          function read(storage) {
+            if (!storage) return null;
+            var value = storage.getItem("authFilesPage.uiState");
+            if (!value) return null;
+            var parsed = JSON.parse(value);
+            return parsed && typeof parsed === "object" ? parsed : null;
+          }
+          try {
+            return read(window.localStorage) || read(window.sessionStorage) || {};
+          } catch (_) {
+            return {};
+          }
+        }
+
+        function normalizeHostProvider(value) {
+          value = String(value || "").trim().toLowerCase().replace(/_/g, "-");
+          if (value === "x-ai" || value === "grok") return "xai";
+          return value;
+        }
+
+        function isRuntimeOnlyAuthFile(file) {
+          var value = file && (file.runtime_only !== undefined ? file.runtime_only : file.runtimeOnly);
+          if (typeof value === "boolean") return value;
+          if (typeof value === "string") return value.trim().toLowerCase() === "true";
+          return false;
+        }
+
+        function hostProblemMessage(file) {
+          var value = file && (file.status_message !== undefined ? file.status_message : file.statusMessage);
+          if (typeof value === "string") return value.trim();
+          return value == null ? "" : String(value).trim();
+        }
+
+        function hostSearchMatches(file, search) {
+          search = String(search || "").trim();
+          if (!search) return true;
+          var regex = null;
+          if (search.indexOf("*") !== -1) {
+            regex = new RegExp(search.split("*").map(function (part) { return part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }).join(".*"), "i");
+          }
+          var lowerSearch = search.toLowerCase();
+          return [file && file.name, file && file.type, file && file.provider].some(function (value) {
+            value = String(value || "");
+            return regex ? regex.test(value) : value.toLowerCase().indexOf(lowerSearch) !== -1;
+          });
+        }
+
+        function hostFileMatchesUIState(file, ui) {
+          ui = ui && typeof ui === "object" ? ui : {};
+          if (!isCodexAuthFile(file) || isRuntimeOnlyAuthFile(file)) return false;
+          var filter = normalizeHostProvider(ui.filter || "all");
+          var provider = normalizeHostProvider(file && (file.type || file.provider));
+          if (filter && filter !== "all" && provider !== filter) return false;
+          if (ui.problemOnly === true && !hostProblemMessage(file)) return false;
+          if (ui.disabledOnly === true && file && file.disabled !== true) return false;
+          return hostSearchMatches(file, ui.search);
+        }
+
+        function hostFilteredCodexAuthFiles() {
+          var ui = readHostAuthFilesUIState();
+          return knownCodexAuthFiles().filter(function (file) { return hostFileMatchesUIState(file, ui); });
+        }
+
+        function selectHostFilteredCodexAuthFiles() {
+          var selected = [];
+          hostFilteredCodexAuthFiles().forEach(function (file) {
+            var index = authIndexOf(file);
+            if (!index) return;
+            rememberAuthFile(file);
+            state.selectedAuthFiles[index] = state.authFilesByIndex[index] || file;
+            selected.push(state.selectedAuthFiles[index]);
+          });
+          return selected;
+        }
+
+        function applyPendingHostSelection() {
+          if (hostSelectionClearPending) {
+            hostSelectionClearPending = false;
+            hostFilteredSelectionPending = false;
+            state.selectedAuthFiles = {};
+            return [];
+          }
+          if (!hostFilteredSelectionPending) return [];
+          hostFilteredSelectionPending = false;
+          return selectHostFilteredCodexAuthFiles();
+        }
+
+        function hostControlFor(target) {
+          var node = target;
+          while (node && node !== document.body) {
+            var tag = String(node.tagName || "").toLowerCase();
+            var role = node.getAttribute && String(node.getAttribute("role") || "").toLowerCase();
+            if (tag === "button" || role === "button") return node;
+            node = node.parentElement;
+          }
+          return null;
+        }
+
+        function hostControlText(target) {
+          var control = hostControlFor(target);
+          if (!control) return "";
+          return [control.textContent, control.getAttribute && control.getAttribute("title"), control.getAttribute && control.getAttribute("aria-label")].map(function (value) { return String(value || "").trim(); }).join(" ").replace(/\s+/g, " ");
+        }
+
+        function isHostFilteredSelectionControl(target) {
+          var text = hostControlText(target);
+          return text.indexOf("全选筛选结果") !== -1 || text.indexOf("全選篩選結果") !== -1 || text.indexOf("Select filtered") !== -1 || text.indexOf("Выбрать по фильтру") !== -1;
+        }
+
+        function isHostSelectionClearControl(target) {
+          var text = hostControlText(target);
+          return text.indexOf("取消选择") !== -1 || text.indexOf("取消選擇") !== -1 || text.indexOf("Deselect") !== -1 || text.indexOf("Отменить") !== -1;
+        }
+
         function selectedCodexAuthFiles() {
           syncSelectedCodexAuthFiles();
           return Object.keys(state.selectedAuthFiles).map(function (index) { return state.authFilesByIndex[index] || state.selectedAuthFiles[index]; }).filter(function (file) { return file && authIndexOf(file); });
@@ -301,9 +425,18 @@ const managementPreheatScript = `<script>
 
         function handleSelectionChange(event) {
           var target = event && event.target;
-          if (!target || String(target.type || "").toLowerCase() !== "checkbox") return;
-          if (target.closest("#codex-preheat-panel") || !isSelectionCheckbox(target)) return;
-          window.setTimeout(function () {
+          if (!target) return;
+          if (target.closest("#codex-preheat-panel")) return;
+          if (isHostFilteredSelectionControl(target)) hostFilteredSelectionPending = true;
+          if (isHostSelectionClearControl(target)) hostSelectionClearPending = true;
+          if (String(target.type || "").toLowerCase() === "checkbox" && !isSelectionCheckbox(target)) return;
+          scheduleSelectionSync();
+        }
+
+        function scheduleSelectionSync() {
+          if (selectionSyncTimer) window.clearTimeout(selectionSyncTimer);
+          selectionSyncTimer = window.setTimeout(function () {
+            selectionSyncTimer = null;
             syncSelectedCodexAuthFiles();
             scheduleRender();
           }, 0);
@@ -326,6 +459,7 @@ const managementPreheatScript = `<script>
               delete state.selectedAuthFiles[index];
             }
           });
+          applyPendingHostSelection();
           return selected;
         }
 

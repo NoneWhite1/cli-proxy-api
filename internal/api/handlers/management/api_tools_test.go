@@ -110,8 +110,8 @@ func TestPreheatCodexAuthFilePinsSelectedCodexAuth(t *testing.T) {
 	if got := call.opts.Metadata[cliproxyexecutor.PinnedAuthMetadataKey]; got != second.ID {
 		t.Fatalf("pinned auth metadata = %#v, want %q", got, second.ID)
 	}
-	if !strings.Contains(string(call.payload), `"content":"1"`) {
-		t.Fatalf("payload did not contain shortest preheat message: %s", string(call.payload))
+	if !strings.Contains(string(call.payload), `"content":"test"`) {
+		t.Fatalf("payload did not contain preheat message: %s", string(call.payload))
 	}
 
 	var resp map[string]any

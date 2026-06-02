@@ -476,7 +476,10 @@ func TestManagementPreheatPanelRetainsSelectionAcrossPages(t *testing.T) {
 		`function knownCodexAuthFiles`,
 		`var nextSelectedAuthFiles = {}`,
 		`nextAuthFilesByIndex[index] = file`,
-		`if (nextAuthFilesByIndex[index]) nextSelectedAuthFiles[index] = nextAuthFilesByIndex[index]`,
+		`var selected = nextAuthFilesByIndex[index] || state.authFilesByIndex[index] || state.selectedAuthFiles[index]`,
+		`if (selected && isCodexAuthFile(selected)) {`,
+		`nextAuthFilesByIndex[index] = nextAuthFilesByIndex[index] || selected`,
+		`nextSelectedAuthFiles[index] = nextAuthFilesByIndex[index]`,
 		`state.selectedAuthFiles = nextSelectedAuthFiles`,
 		`state.selectedAuthFiles[index] = state.authFilesByIndex[index] || file`,
 		`return state.authFilesByIndex[index] || state.selectedAuthFiles[index]`,
@@ -486,6 +489,9 @@ func TestManagementPreheatPanelRetainsSelectionAcrossPages(t *testing.T) {
 		if !strings.Contains(script, token) {
 			t.Fatalf("preheat script should retain selected Codex credentials across pages; missing %q", token)
 		}
+	}
+	if strings.Contains(script, `if (nextAuthFilesByIndex[index]) nextSelectedAuthFiles[index] = nextAuthFilesByIndex[index]`) {
+		t.Fatalf("preheat script should not prune selected credentials just because the latest auth-files response omitted them")
 	}
 }
 
@@ -497,7 +503,8 @@ func TestManagementPreheatPanelReconcilesObservedAuthFiles(t *testing.T) {
 		`var nextSelectedAuthFiles = {}`,
 		`nextAuthFilesByIndex[index] = file`,
 		`if (normalized && normalized.fetched_refresh_time) nextRefreshTimes[index] = normalized`,
-		`if (nextAuthFilesByIndex[index]) nextSelectedAuthFiles[index] = nextAuthFilesByIndex[index]`,
+		`var selected = nextAuthFilesByIndex[index] || state.authFilesByIndex[index] || state.selectedAuthFiles[index]`,
+		`nextSelectedAuthFiles[index] = nextAuthFilesByIndex[index]`,
 		`state.authFilesByIndex = nextAuthFilesByIndex`,
 		`state.refreshTimes = nextRefreshTimes`,
 		`state.selectedAuthFiles = nextSelectedAuthFiles`,
@@ -506,8 +513,61 @@ func TestManagementPreheatPanelReconcilesObservedAuthFiles(t *testing.T) {
 			t.Fatalf("preheat script should reconcile auth-file, refresh-time, and selection caches from the latest auth-files response; missing %q", token)
 		}
 	}
+	if strings.Contains(script, `if (nextAuthFilesByIndex[index]) nextSelectedAuthFiles[index] = nextAuthFilesByIndex[index]`) {
+		t.Fatalf("preheat script should preserve selected known credentials outside the latest auth-files response")
+	}
 	if strings.Contains(script, `delete state.refreshTimes[index]`) {
 		t.Fatalf("preheat script should reconcile refresh state by replacing the observed refresh map, not ad-hoc deletes")
+	}
+}
+
+func TestManagementPreheatPanelSchedulesSelectionSyncAfterBulkSelection(t *testing.T) {
+	script := managementPreheatScript
+	for _, token := range []string{
+		`var selectionSyncTimer = null`,
+		`document.addEventListener("click", handleSelectionChange, true)`,
+		`document.addEventListener("input", handleSelectionChange, true)`,
+		`document.addEventListener("change", handleSelectionChange, true)`,
+		`function scheduleSelectionSync`,
+		`if (selectionSyncTimer) window.clearTimeout(selectionSyncTimer)`,
+		`selectionSyncTimer = window.setTimeout(function ()`,
+		`syncSelectedCodexAuthFiles();`,
+		`if (target.closest("#codex-preheat-panel")) return`,
+		`if (String(target.type || "").toLowerCase() === "checkbox" && !isSelectionCheckbox(target)) return`,
+		`scheduleSelectionSync();`,
+	} {
+		if !strings.Contains(script, token) {
+			t.Fatalf("preheat script should schedule selection sync after host bulk-selection UI changes; missing %q", token)
+		}
+	}
+}
+
+func TestManagementPreheatPanelIncludesHostFilteredSelection(t *testing.T) {
+	script := managementPreheatScript
+	for _, token := range []string{
+		`var hostFilteredSelectionPending = false`,
+		`var hostSelectionClearPending = false`,
+		`"authFilesPage.uiState"`,
+		`function readHostAuthFilesUIState`,
+		`function isHostFilteredSelectionControl`,
+		`function isHostSelectionClearControl`,
+		`全选筛选结果`,
+		`全選篩選結果`,
+		`Select filtered`,
+		`Выбрать по фильтру`,
+		`function applyPendingHostSelection`,
+		`function selectHostFilteredCodexAuthFiles`,
+		`function hostFilteredCodexAuthFiles`,
+		`function hostFileMatchesUIState`,
+		`function normalizeHostProvider`,
+		`function isRuntimeOnlyAuthFile`,
+		`knownCodexAuthFiles().filter(function (file) { return hostFileMatchesUIState(file, ui); })`,
+		`state.selectedAuthFiles[index] = state.authFilesByIndex[index] || file`,
+		`applyPendingHostSelection();`,
+	} {
+		if !strings.Contains(script, token) {
+			t.Fatalf("preheat script should include host filtered selections beyond rendered rows; missing %q", token)
+		}
 	}
 }
 
