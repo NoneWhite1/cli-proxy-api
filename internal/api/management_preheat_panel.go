@@ -479,19 +479,29 @@ const managementPreheatScript = `<script>
           return null;
         }
 
+        function classNameHasPrefix(className, prefix) {
+          return String(className || "").split(/\s+/).some(function (part) {
+            return part.indexOf(prefix) === 0 || part.indexOf("__" + prefix) !== -1;
+          });
+        }
+
+        function isAuthFileCard(node) {
+          var className = node && node.className;
+          return classNameHasPrefix(className, "fileCard___") || classNameHasPrefix(className, "fileCardCompact___");
+        }
+
+        function isAuthFileRow(node) {
+          var tag = String((node && node.tagName) || "").toLowerCase();
+          return tag === "tr" || tag === "li";
+        }
+
         function authContainerForCheckbox(checkbox, file) {
           var node = checkbox;
-          var fallback = null;
           while (node && node !== document.body) {
-            var tag = String(node.tagName || "").toLowerCase();
-            var className = String(node.className || "");
-            var isCard = className.indexOf("fileCard") !== -1 && className.indexOf("fileCardLayout") === -1 && className.indexOf("fileCardMain") === -1;
-            var isRow = tag === "tr" || tag === "li";
-            if ((isCard || isRow) && (!file || rowTextMatchesFile(node, file))) return node;
-            if (!fallback && file && rowTextMatchesFile(node, file)) fallback = node;
+            if (file && (isAuthFileCard(node) || isAuthFileRow(node)) && rowTextMatchesFile(node, file)) return node;
             node = node.parentElement;
           }
-          return fallback || checkbox.closest("tr") || checkbox.closest("li") || checkbox.closest("div");
+          return null;
         }
 
         function authRowForCheckbox(checkbox) {

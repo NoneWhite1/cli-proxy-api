@@ -595,13 +595,40 @@ func TestManagementPreheatPanelWalksSelectionAncestors(t *testing.T) {
 		`function fileForCheckbox`,
 		`function authContainerForCheckbox`,
 		`while (node && node !== document.body)`,
-		`className.indexOf("fileCard") !== -1`,
-		`className.indexOf("fileCardLayout") === -1`,
-		`className.indexOf("fileCardMain") === -1`,
+		`function classNameHasPrefix`,
+		`function isAuthFileCard`,
+		`classNameHasPrefix(className, "fileCard___")`,
+		`classNameHasPrefix(className, "fileCardCompact___")`,
+		`part.indexOf("__" + prefix) !== -1`,
+		`function isAuthFileRow`,
 		`return authContainerForCheckbox(checkbox, fileForCheckbox(checkbox))`,
 	} {
 		if !strings.Contains(script, token) {
 			t.Fatalf("preheat script should resolve and hide whole credential cards; missing %q", token)
+		}
+	}
+}
+
+func TestManagementPreheatPanelMissingRefreshTimeFilterScopesRows(t *testing.T) {
+	script := managementPreheatScript
+	for _, token := range []string{
+		`fileCard___`,
+		`__" + prefix`,
+		`fileCardCompact___`,
+		`return null;`,
+		`if (checkbox.closest("#codex-preheat-panel") || !isSelectionCheckbox(checkbox)) return`,
+		`body: JSON.stringify({ operation: operation, auth_indices: indexes })`,
+	} {
+		if !strings.Contains(script, token) {
+			t.Fatalf("missing-refresh-time filter should scope row hiding to credential cards and preserve request/selection contracts; missing %q", token)
+		}
+	}
+	for _, token := range []string{
+		`if (!fallback && file && rowTextMatchesFile(node, file)) fallback = node`,
+		`checkbox.closest("div")`,
+	} {
+		if strings.Contains(script, token) {
+			t.Fatalf("missing-refresh-time filter must not hide arbitrary shared ancestors; found %q", token)
 		}
 	}
 }
