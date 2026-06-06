@@ -299,6 +299,7 @@ func TestPersistCodexRefreshStateOnlyWritesRefreshStateFields(t *testing.T) {
 			"exact_seven_day_refresh": true,
 			"preheat_needed":          true,
 			"weekly_reset_at":         "old",
+			"weekly_gate_reset_at":    "old-gate",
 			"fetched_at":              "old",
 		},
 	}
@@ -306,7 +307,14 @@ func TestPersistCodexRefreshStateOnlyWritesRefreshStateFields(t *testing.T) {
 		t.Fatalf("register auth: %v", errRegister)
 	}
 	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
-	state := codexRefreshState{FetchedRefreshTime: true, ExactSevenDayRefresh: false, PreheatNeeded: false, WeeklyResetAt: "2026-06-08T12:00:00Z", FetchedAt: "2026-06-01T12:00:00Z"}
+	state := codexRefreshState{
+		FetchedRefreshTime:   true,
+		ExactSevenDayRefresh: false,
+		PreheatNeeded:        false,
+		WeeklyResetAt:        "2026-06-08T12:00:00Z",
+		WeeklyGateResetAt:    "2026-06-09T12:00:00Z",
+		FetchedAt:            "2026-06-01T12:00:00Z",
+	}
 	if err := h.persistCodexRefreshState(context.Background(), auth.ID, state); err != nil {
 		t.Fatalf("persist refresh state: %v", err)
 	}
@@ -328,6 +336,9 @@ func TestPersistCodexRefreshStateOnlyWritesRefreshStateFields(t *testing.T) {
 	}
 	if got := updated.Metadata["weekly_reset_at"]; got != state.WeeklyResetAt {
 		t.Fatalf("weekly_reset_at = %#v, want %q", got, state.WeeklyResetAt)
+	}
+	if got := updated.Metadata["weekly_gate_reset_at"]; got != state.WeeklyGateResetAt {
+		t.Fatalf("weekly_gate_reset_at = %#v, want %q", got, state.WeeklyGateResetAt)
 	}
 	if got := updated.Metadata["fetched_at"]; got != state.FetchedAt {
 		t.Fatalf("fetched_at = %#v, want %q", got, state.FetchedAt)

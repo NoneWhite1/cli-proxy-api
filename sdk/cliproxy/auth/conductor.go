@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	codexauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
@@ -1926,13 +1927,38 @@ func disallowFreeAuthFromMetadata(meta map[string]any) bool {
 }
 
 func isFreeCodexAuth(auth *Auth) bool {
-	if auth == nil || auth.Attributes == nil {
-		return false
+	return strings.EqualFold(codexPlanTypeFromAuth(auth), "free")
+}
+
+func codexPlanTypeFromAuth(auth *Auth) string {
+	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		return ""
 	}
-	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
-		return false
+	if auth.Attributes != nil {
+		if planType := strings.TrimSpace(auth.Attributes["plan_type"]); planType != "" {
+			return planType
+		}
 	}
-	return strings.EqualFold(strings.TrimSpace(auth.Attributes["plan_type"]), "free")
+	if auth.Metadata == nil {
+		return ""
+	}
+	for _, key := range []string{"plan_type", "planType"} {
+		if value, ok := auth.Metadata[key].(string); ok {
+			if planType := strings.TrimSpace(value); planType != "" {
+				return planType
+			}
+		}
+	}
+	idToken, _ := auth.Metadata["id_token"].(string)
+	idToken = strings.TrimSpace(idToken)
+	if idToken == "" {
+		return ""
+	}
+	claims, err := codexauth.ParseJWTToken(idToken)
+	if err != nil || claims == nil {
+		return ""
+	}
+	return strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType)
 }
 
 func publishSelectedAuthMetadata(meta map[string]any, authID string) {
@@ -2677,7 +2703,26 @@ func autoQuotaRecoveryAt(auth *Auth) (time.Time, bool) {
 	if recoverAt.IsZero() {
 		return time.Time{}, false
 	}
+	if gateAt, ok := codexWeeklyGateResetAt(auth); ok && gateAt.After(recoverAt) {
+		recoverAt = gateAt
+	}
 	return recoverAt, true
+}
+
+func codexWeeklyGateResetAt(auth *Auth) (time.Time, bool) {
+	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") || auth.Metadata == nil {
+		return time.Time{}, false
+	}
+	value, _ := auth.Metadata["weekly_gate_reset_at"].(string)
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}, false
+	}
+	gateAt, err := time.Parse(time.RFC3339, value)
+	if err != nil || gateAt.IsZero() {
+		return time.Time{}, false
+	}
+	return gateAt, true
 }
 
 // ClearAutoQuotaDisabledState removes automatic Codex quota recovery markers
@@ -3254,6 +3299,9 @@ func markAuthAutoDisabledForQuota(auth *Auth, state *ModelState, retryAfter *tim
 			recoverAt = now.Add(cooldown)
 		}
 		backoffLevel = nextLevel
+	}
+	if gateAt, ok := codexWeeklyGateResetAt(auth); ok && gateAt.After(recoverAt) {
+		recoverAt = gateAt
 	}
 
 	auth.Disabled = true

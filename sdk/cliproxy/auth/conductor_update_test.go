@@ -246,6 +246,75 @@ func TestManager_CodexQuotaRecoveryLoopKeepsNotDueCredentialDisabled(t *testing.
 	}
 }
 
+func TestAutoQuotaRecoveryAtUsesFutureCodexWeeklyGate(t *testing.T) {
+	now := time.Now().UTC()
+	recoverAt := now.Add(time.Minute)
+	weeklyGateAt := now.Add(time.Hour).Truncate(time.Second)
+	auth := &Auth{
+		ID:             "codex-weekly-gated",
+		Provider:       "codex",
+		Disabled:       true,
+		Status:         StatusDisabled,
+		NextRetryAfter: recoverAt,
+		Metadata:       map[string]any{"weekly_gate_reset_at": weeklyGateAt.Format(time.RFC3339)},
+		Quota: QuotaState{
+			Exceeded:      true,
+			Reason:        quotaAutoDisabledReason,
+			NextRecoverAt: recoverAt,
+		},
+	}
+
+	got, ok := autoQuotaRecoveryAt(auth)
+	if !ok {
+		t.Fatal("autoQuotaRecoveryAt() ok = false, want true")
+	}
+	if !got.Equal(weeklyGateAt) {
+		t.Fatalf("autoQuotaRecoveryAt() = %s, want weekly gate %s", got, weeklyGateAt)
+	}
+}
+
+func TestManager_CodexQuotaRecoveryLoopKeepsWeeklyGatedCredentialDisabled(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m.StartAutoRefresh(ctx, time.Hour)
+	defer m.StopAutoRefresh()
+
+	weeklyGateAt := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
+	if _, errRegister := m.Register(ctx, &Auth{
+		ID:       "codex-weekly-gated",
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"access_token":         "token",
+			"weekly_gate_reset_at": weeklyGateAt.Format(time.RFC3339),
+		},
+	}); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	retryAfter := 25 * time.Millisecond
+	m.MarkResult(ctx, Result{
+		AuthID:     "codex-weekly-gated",
+		Provider:   "codex",
+		Model:      "gpt-5",
+		Success:    false,
+		RetryAfter: &retryAfter,
+		Error:      &Error{HTTPStatus: http.StatusTooManyRequests, Message: `{"error":{"type":"usage_limit_reached"}}`},
+	})
+
+	time.Sleep(100 * time.Millisecond)
+	updated, ok := m.GetByID("codex-weekly-gated")
+	if !ok || updated == nil {
+		t.Fatal("expected auth to be present")
+	}
+	if !updated.Disabled || updated.Status != StatusDisabled || updated.Quota.Reason != quotaAutoDisabledReason {
+		t.Fatalf("weekly-gated credential recovered early: disabled=%v status=%q quota=%+v", updated.Disabled, updated.Status, updated.Quota)
+	}
+	if !updated.Quota.NextRecoverAt.Equal(weeklyGateAt) {
+		t.Fatalf("next recover at = %s, want weekly gate %s", updated.Quota.NextRecoverAt, weeklyGateAt)
+	}
+}
+
 func TestManager_CodexQuotaRecoveryLoopRecoversManualDisableWithAutoQuotaMarker(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())

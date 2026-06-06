@@ -1705,13 +1705,38 @@ var imageGenToolJSON = []byte(`{"type":"image_generation","output_format":"png"}
 var imageGenToolArrayJSON = []byte(`[{"type":"image_generation","output_format":"png"}]`)
 
 func isCodexFreePlanAuth(auth *cliproxyauth.Auth) bool {
-	if auth == nil || auth.Attributes == nil {
-		return false
+	return strings.EqualFold(codexPlanTypeFromAuth(auth), "free")
+}
+
+func codexPlanTypeFromAuth(auth *cliproxyauth.Auth) string {
+	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		return ""
 	}
-	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
-		return false
+	if auth.Attributes != nil {
+		if planType := strings.TrimSpace(auth.Attributes["plan_type"]); planType != "" {
+			return planType
+		}
 	}
-	return strings.EqualFold(strings.TrimSpace(auth.Attributes["plan_type"]), "free")
+	if auth.Metadata == nil {
+		return ""
+	}
+	for _, key := range []string{"plan_type", "planType"} {
+		if value, ok := auth.Metadata[key].(string); ok {
+			if planType := strings.TrimSpace(value); planType != "" {
+				return planType
+			}
+		}
+	}
+	idToken, _ := auth.Metadata["id_token"].(string)
+	idToken = strings.TrimSpace(idToken)
+	if idToken == "" {
+		return ""
+	}
+	claims, err := codexauth.ParseJWTToken(idToken)
+	if err != nil || claims == nil {
+		return ""
+	}
+	return strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType)
 }
 
 func ensureImageGenerationTool(body []byte, baseModel string, auth *cliproxyauth.Auth) []byte {

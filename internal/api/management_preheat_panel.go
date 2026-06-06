@@ -78,6 +78,9 @@ const managementPreheatScript = `<script>
           if (!out.exact_seven_day_refresh && typeof value.weekly_reset_at === "string" && !isNaN(Date.parse(value.weekly_reset_at))) {
             out.weekly_reset_at = value.weekly_reset_at;
           }
+          if (typeof value.weekly_gate_reset_at === "string" && !isNaN(Date.parse(value.weekly_gate_reset_at))) {
+            out.weekly_gate_reset_at = value.weekly_gate_reset_at;
+          }
           return out;
         }
 
@@ -536,7 +539,8 @@ const managementPreheatScript = `<script>
               badge.className = "codex-preheat-row-badge";
               row.insertBefore(badge, row.firstChild);
             }
-            badge.className = "codex-preheat-row-badge" + (refresh.preheat_needed ? " ready" : refresh.weekly_reset_at ? " scheduled" : "");
+            var gated = weeklyGateActive(refresh);
+            badge.className = "codex-preheat-row-badge" + (gated || refresh.weekly_reset_at ? " scheduled" : refresh.preheat_needed ? " ready" : "");
             badge.textContent = refreshLabel(refresh);
             if (state.showOnlyNoRefreshTime && refresh.fetched_refresh_time) {
               if (row.__cliproxyCodexPreheatDisplay === undefined) row.__cliproxyCodexPreheatDisplay = row.style.display || "";
@@ -568,9 +572,16 @@ const managementPreheatScript = `<script>
 
         function refreshLabel(refresh) {
           if (!refresh || !refresh.fetched_refresh_time) return "未获取刷新时间";
+          if (weeklyGateActive(refresh)) return "已获取刷新时间：周限额刷新 " + formatResetTime(refresh.weekly_gate_reset_at);
           if (refresh.preheat_needed || refresh.exact_seven_day_refresh) return "已获取刷新时间：需要预热";
           if (refresh.weekly_reset_at) return "已获取刷新时间：" + formatResetTime(refresh.weekly_reset_at);
           return "已获取刷新时间";
+        }
+
+        function weeklyGateActive(refresh) {
+          if (!refresh || typeof refresh.weekly_gate_reset_at !== "string") return false;
+          var time = Date.parse(refresh.weekly_gate_reset_at);
+          return !isNaN(time) && time > Date.now();
         }
 
         function formatResetTime(value) {
@@ -588,6 +599,10 @@ const managementPreheatScript = `<script>
               return;
             }
             counts.fetched++;
+            if (weeklyGateActive(refresh)) {
+              counts.scheduled++;
+              return;
+            }
             if (refresh.preheat_needed || refresh.exact_seven_day_refresh) counts.ready++;
             if (refresh.weekly_reset_at) counts.scheduled++;
           });

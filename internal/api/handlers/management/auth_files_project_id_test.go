@@ -199,6 +199,7 @@ func TestListAuthFiles_IncludesRefreshStateFieldsFromManager(t *testing.T) {
 			"exact_seven_day_refresh": false,
 			"preheat_needed":          false,
 			"weekly_reset_at":         "2026-06-08T12:00:00Z",
+			"weekly_gate_reset_at":    "2026-06-09T12:00:00Z",
 			"fetched_at":              "2026-06-01T12:00:00Z",
 		},
 	}
@@ -221,6 +222,9 @@ func TestListAuthFiles_IncludesRefreshStateFieldsFromManager(t *testing.T) {
 	}
 	if got := entry["weekly_reset_at"]; got != "2026-06-08T12:00:00Z" {
 		t.Fatalf("expected weekly_reset_at %q, got %#v", "2026-06-08T12:00:00Z", got)
+	}
+	if got := entry["weekly_gate_reset_at"]; got != "2026-06-09T12:00:00Z" {
+		t.Fatalf("expected weekly_gate_reset_at %q, got %#v", "2026-06-09T12:00:00Z", got)
 	}
 	if got := entry["fetched_at"]; got != "2026-06-01T12:00:00Z" {
 		t.Fatalf("expected fetched_at %q, got %#v", "2026-06-01T12:00:00Z", got)
@@ -338,7 +342,7 @@ func TestListAuthFilesFromDisk_IncludesRefreshStateFields(t *testing.T) {
 
 	authDir := t.TempDir()
 	filePath := filepath.Join(authDir, "codex-user@example.com-refresh.json")
-	if errWrite := os.WriteFile(filePath, []byte(`{"type":"codex","email":"user@example.com","fetched_refresh_time":true,"exact_seven_day_refresh":false,"preheat_needed":false,"weekly_reset_at":"2026-06-08T12:00:00Z","fetched_at":"2026-06-01T12:00:00Z"}`), 0o600); errWrite != nil {
+	if errWrite := os.WriteFile(filePath, []byte(`{"type":"codex","email":"user@example.com","fetched_refresh_time":true,"exact_seven_day_refresh":false,"preheat_needed":false,"weekly_reset_at":"2026-06-08T12:00:00Z","weekly_gate_reset_at":"2026-06-09T12:00:00Z","fetched_at":"2026-06-01T12:00:00Z"}`), 0o600); errWrite != nil {
 		t.Fatalf("failed to write auth file: %v", errWrite)
 	}
 
@@ -356,6 +360,9 @@ func TestListAuthFilesFromDisk_IncludesRefreshStateFields(t *testing.T) {
 	}
 	if got := entry["weekly_reset_at"]; got != "2026-06-08T12:00:00Z" {
 		t.Fatalf("expected weekly_reset_at %q, got %#v", "2026-06-08T12:00:00Z", got)
+	}
+	if got := entry["weekly_gate_reset_at"]; got != "2026-06-09T12:00:00Z" {
+		t.Fatalf("expected weekly_gate_reset_at %q, got %#v", "2026-06-09T12:00:00Z", got)
 	}
 	if got := entry["fetched_at"]; got != "2026-06-01T12:00:00Z" {
 		t.Fatalf("expected fetched_at %q, got %#v", "2026-06-01T12:00:00Z", got)

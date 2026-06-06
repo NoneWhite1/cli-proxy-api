@@ -2,7 +2,9 @@ package auth
 
 import (
 	"context"
+	"encoding/base64"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -365,6 +367,48 @@ func TestManager_PickNextMixed_DisallowFreeAuthSkipsCodexFreePlan(t *testing.T) 
 	if got.ID != "codex-b-plus" {
 		t.Fatalf("pickNextMixed() auth.ID = %q, want %q", got.ID, "codex-b-plus")
 	}
+}
+
+func TestManager_PickNextMixed_DisallowFreeAuthSkipsCodexFreePlanFromMetadata(t *testing.T) {
+	testCases := map[string]map[string]any{
+		"metadata snake case": {"plan_type": "free"},
+		"metadata camel case": {"planType": "free"},
+		"id token claim":      {"id_token": codexPlanTypeIDTokenForAuthTest("free")},
+	}
+
+	for name, metadata := range testCases {
+		t.Run(name, func(t *testing.T) {
+			model := "gpt-5.4-mini-" + strings.ReplaceAll(name, " ", "-")
+			registerSchedulerModels(t, "codex", model, "codex-a-free", "codex-b-plus")
+
+			manager := NewManager(nil, &RoundRobinSelector{}, nil)
+			manager.executors["codex"] = schedulerTestExecutor{}
+			if _, errRegister := manager.Register(context.Background(), &Auth{ID: "codex-a-free", Provider: "codex", Metadata: metadata}); errRegister != nil {
+				t.Fatalf("Register(codex-a-free) error = %v", errRegister)
+			}
+			if _, errRegister := manager.Register(context.Background(), &Auth{ID: "codex-b-plus", Provider: "codex", Attributes: map[string]string{"plan_type": "plus"}}); errRegister != nil {
+				t.Fatalf("Register(codex-b-plus) error = %v", errRegister)
+			}
+
+			opts := cliproxyexecutor.Options{Metadata: map[string]any{cliproxyexecutor.DisallowFreeAuthMetadataKey: true}}
+			got, _, provider, errPick := manager.pickNextMixed(context.Background(), []string{"codex"}, model, opts, map[string]struct{}{})
+			if errPick != nil {
+				t.Fatalf("pickNextMixed() error = %v", errPick)
+			}
+			if got == nil || got.ID != "codex-b-plus" {
+				t.Fatalf("pickNextMixed() auth = %v, want codex-b-plus", got)
+			}
+			if provider != "codex" {
+				t.Fatalf("pickNextMixed() provider = %q, want codex", provider)
+			}
+		})
+	}
+}
+
+func codexPlanTypeIDTokenForAuthTest(planType string) string {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"https://api.openai.com/auth":{"chatgpt_plan_type":"` + planType + `"}}`))
+	return header + "." + payload + ".signature"
 }
 
 func TestManagerCustomSelector_FallsBackToLegacyPath(t *testing.T) {

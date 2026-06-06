@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"encoding/base64"
 	"testing"
 
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -102,17 +103,42 @@ func TestEnsureImageGenerationTool_GPT53CodexSparkDoesNotInjectTool(t *testing.T
 }
 
 func TestEnsureImageGenerationTool_FreeCodexAuthDoesNotInjectTool(t *testing.T) {
-	body := []byte(`{"model":"gpt-5.4","input":"draw a cat"}`)
-	freeAuth := &cliproxyauth.Auth{
-		Provider:   "codex",
-		Attributes: map[string]string{"plan_type": "free"},
+	testCases := map[string]*cliproxyauth.Auth{
+		"attributes": {
+			Provider:   "codex",
+			Attributes: map[string]string{"plan_type": "free"},
+		},
+		"metadata snake case": {
+			Provider: "codex",
+			Metadata: map[string]any{"plan_type": "free"},
+		},
+		"metadata camel case": {
+			Provider: "codex",
+			Metadata: map[string]any{"planType": "free"},
+		},
+		"id token claim": {
+			Provider: "codex",
+			Metadata: map[string]any{"id_token": codexPlanTypeIDTokenForTest("free")},
+		},
 	}
-	result := ensureImageGenerationTool(body, "gpt-5.4", freeAuth)
 
-	if string(result) != string(body) {
-		t.Fatalf("expected body to be unchanged, got %s", string(result))
+	for name, freeAuth := range testCases {
+		t.Run(name, func(t *testing.T) {
+			body := []byte(`{"model":"gpt-5.4","input":"draw a cat"}`)
+			result := ensureImageGenerationTool(body, "gpt-5.4", freeAuth)
+
+			if string(result) != string(body) {
+				t.Fatalf("expected body to be unchanged, got %s", string(result))
+			}
+			if gjson.GetBytes(result, "tools").Exists() {
+				t.Fatalf("expected no tools for free codex auth, got %s", gjson.GetBytes(result, "tools").Raw)
+			}
+		})
 	}
-	if gjson.GetBytes(result, "tools").Exists() {
-		t.Fatalf("expected no tools for free codex auth, got %s", gjson.GetBytes(result, "tools").Raw)
-	}
+}
+
+func codexPlanTypeIDTokenForTest(planType string) string {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"https://api.openai.com/auth":{"chatgpt_plan_type":"` + planType + `"}}`))
+	return header + "." + payload + ".signature"
 }

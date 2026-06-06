@@ -42,7 +42,7 @@ import (
 
 var lastRefreshKeys = []string{"last_refresh", "lastRefresh", "last_refreshed_at", "lastRefreshedAt"}
 var refreshIntervalKeys = []string{"refresh_interval_seconds", "refreshIntervalSeconds", "refresh_interval", "refreshInterval"}
-var refreshStateKeys = []string{"fetched_refresh_time", "exact_seven_day_refresh", "preheat_needed", "weekly_reset_at", "fetched_at"}
+var refreshStateKeys = []string{"fetched_refresh_time", "exact_seven_day_refresh", "preheat_needed", "weekly_reset_at", "weekly_gate_reset_at", "fetched_at"}
 
 const (
 	anthropicCallbackPort        = 54545
@@ -571,7 +571,7 @@ func copyRefreshStateFieldsFromJSON(entry gin.H, data []byte) {
 			if value.Type == gjson.True || value.Type == gjson.False {
 				entry[key] = value.Bool()
 			}
-		case "weekly_reset_at", "fetched_at":
+		case "weekly_reset_at", "weekly_gate_reset_at", "fetched_at":
 			if value.Type == gjson.String {
 				entry[key] = value.String()
 			}
@@ -588,7 +588,7 @@ func copyRefreshStateValue(entry gin.H, key string, value any) {
 		if parsed, ok := authFileBoolValue(value); ok {
 			entry[key] = parsed
 		}
-	case "weekly_reset_at", "fetched_at":
+	case "weekly_reset_at", "weekly_gate_reset_at", "fetched_at":
 		if text, ok := value.(string); ok {
 			entry[key] = text
 		}
