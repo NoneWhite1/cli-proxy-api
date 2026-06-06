@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,8 +30,10 @@ const (
 	preheatOperationRefreshTime    = "refresh_time"
 	preheatOperationPreheatRefresh = "preheat_refresh"
 
-	codexUsageURL       = "https://chatgpt.com/backend-api/wham/usage"
-	codexUsageUserAgent = "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal"
+	codexUsageURL              = "https://chatgpt.com/backend-api/wham/usage"
+	codexUsageUserAgent        = "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal"
+	fiveHourQuotaWindowSeconds = 5 * 60 * 60
+	weeklyQuotaWindowSeconds   = 7 * 24 * 60 * 60
 )
 
 var monthlyQuotaWindowSeconds = map[int64]struct{}{
@@ -105,7 +108,13 @@ type codexRefreshState struct {
 	ExactSevenDayRefresh bool   `json:"exact_seven_day_refresh"`
 	PreheatNeeded        bool   `json:"preheat_needed"`
 	WeeklyResetAt        string `json:"weekly_reset_at"`
+	WeeklyGateResetAt    string `json:"weekly_gate_reset_at"`
 	FetchedAt            string `json:"fetched_at"`
+}
+
+type codexQuotaWindow struct {
+	window  map[string]any
+	seconds int64
 }
 
 type startPreheatJobRequest struct {
@@ -596,6 +605,12 @@ func (m *preheatJobManager) dueAutoAuths(now time.Time) []*coreauth.Auth {
 		if !state.FetchedRefreshTime {
 			continue
 		}
+		if state.WeeklyGateResetAt != "" {
+			gateAt, err := time.Parse(time.RFC3339, state.WeeklyGateResetAt)
+			if err == nil && gateAt.After(now) {
+				continue
+			}
+		}
 		if state.ExactSevenDayRefresh && state.PreheatNeeded {
 			out = append(out, auth)
 			continue
@@ -795,17 +810,35 @@ func (l *usageStartLimiter) wait(ctx context.Context) error {
 }
 
 func normalizeCodexUsageRefreshState(usage map[string]any, now time.Time) (codexRefreshState, error) {
+	state := codexRefreshState{FetchedRefreshTime: true, FetchedAt: now.UTC().Format(time.RFC3339), ExactSevenDayRefresh: false, PreheatNeeded: false}
+	windows := quotaWindowsOf(usage)
+	if fiveHourWindow, ok := firstQuotaWindowWithSeconds(windows, fiveHourQuotaWindowSeconds); ok {
+		if err := setCodexRefreshStateFromWindow(&state, fiveHourWindow.window, fiveHourWindow.seconds, now); err != nil {
+			return codexRefreshState{FetchedRefreshTime: false}, err
+		}
+		state.WeeklyGateResetAt = weeklyGateResetAt(windows, now)
+		return state, nil
+	}
 	window, seconds, ok := quotaResetWindowOf(usage)
 	if !ok {
 		return codexRefreshState{FetchedRefreshTime: false}, fmt.Errorf("unrecognized monthly quota window")
 	}
+	if err := setCodexRefreshStateFromWindow(&state, window, seconds, now); err != nil {
+		return codexRefreshState{FetchedRefreshTime: false}, err
+	}
+	return state, nil
+}
+
+func setCodexRefreshStateFromWindow(state *codexRefreshState, window map[string]any, seconds int64, now time.Time) error {
+	if state == nil || window == nil {
+		return fmt.Errorf("missing reset time")
+	}
 	resetAfter, hasResetAfter := numberField(window, "reset_after_seconds", "resetAfterSeconds")
 	resetAt, hasResetAt := numberField(window, "reset_at", "resetAt")
-	state := codexRefreshState{FetchedRefreshTime: true, FetchedAt: now.UTC().Format(time.RFC3339), ExactSevenDayRefresh: false, PreheatNeeded: false}
 	if (hasResetAfter && int64(resetAfter+0.5) == seconds) || (hasResetAt && int64(resetAt)-now.Unix() == seconds) {
 		state.ExactSevenDayRefresh = true
 		state.PreheatNeeded = true
-		return state, nil
+		return nil
 	}
 	var reset time.Time
 	if hasResetAt && resetAt > 0 {
@@ -814,13 +847,23 @@ func normalizeCodexUsageRefreshState(usage map[string]any, now time.Time) (codex
 		reset = now.Add(time.Duration(resetAfter * float64(time.Second))).UTC()
 	}
 	if reset.IsZero() {
-		return codexRefreshState{FetchedRefreshTime: false}, fmt.Errorf("missing reset time")
+		return fmt.Errorf("missing reset time")
 	}
 	state.WeeklyResetAt = reset.Format(time.RFC3339)
-	return state, nil
+	return nil
 }
 
 func quotaResetWindowOf(usage map[string]any) (map[string]any, int64, bool) {
+	for _, window := range quotaWindowsOf(usage) {
+		if _, monthly := monthlyQuotaWindowSeconds[window.seconds]; monthly {
+			return window.window, window.seconds, true
+		}
+	}
+	return nil, 0, false
+}
+
+func quotaWindowsOf(usage map[string]any) []codexQuotaWindow {
+	windows := make([]codexQuotaWindow, 0)
 	for _, rateLimit := range rateLimitCandidatesOf(usage) {
 		for _, key := range []string{"primary_window", "primaryWindow", "primary", "secondary_window", "secondaryWindow", "secondary"} {
 			window, _ := rateLimit[key].(map[string]any)
@@ -829,14 +872,54 @@ func quotaResetWindowOf(usage map[string]any) (map[string]any, int64, bool) {
 			}
 			secondsFloat, ok := numberFieldValue(firstPresent(window, "limit_window_seconds", "limitWindowSeconds"))
 			seconds := int64(secondsFloat + 0.5)
-			if ok {
-				if _, monthly := monthlyQuotaWindowSeconds[seconds]; monthly {
-					return window, seconds, true
-				}
+			if ok && seconds > 0 {
+				windows = append(windows, codexQuotaWindow{window: window, seconds: seconds})
 			}
 		}
 	}
-	return nil, 0, false
+	return windows
+}
+
+func firstQuotaWindowWithSeconds(windows []codexQuotaWindow, seconds int64) (codexQuotaWindow, bool) {
+	for _, window := range windows {
+		if window.seconds == seconds {
+			return window, true
+		}
+	}
+	return codexQuotaWindow{}, false
+}
+
+func weeklyGateResetAt(windows []codexQuotaWindow, now time.Time) string {
+	for _, window := range windows {
+		if window.seconds != weeklyQuotaWindowSeconds || !quotaWindowLimitReached(window) {
+			continue
+		}
+		reset, ok := resetTimeFromWindow(window.window, now)
+		if ok {
+			return reset.Format(time.RFC3339)
+		}
+	}
+	return ""
+}
+
+func quotaWindowLimitReached(window codexQuotaWindow) bool {
+	if reached, ok := boolField(window.window, "limit_reached", "limitReached"); ok && reached {
+		return true
+	}
+	used, ok := numberField(window.window, "used_percent", "usedPercent")
+	return ok && used >= 100
+}
+
+func resetTimeFromWindow(window map[string]any, now time.Time) (time.Time, bool) {
+	resetAfter, hasResetAfter := numberField(window, "reset_after_seconds", "resetAfterSeconds")
+	resetAt, hasResetAt := numberField(window, "reset_at", "resetAt")
+	if hasResetAt && resetAt > 0 {
+		return time.Unix(int64(resetAt), 0).UTC(), true
+	}
+	if hasResetAfter && resetAfter >= 0 {
+		return now.Add(time.Duration(resetAfter * float64(time.Second))).UTC(), true
+	}
+	return time.Time{}, false
 }
 
 func rateLimitCandidatesOf(usage map[string]any) []map[string]any {
@@ -903,6 +986,23 @@ func numberFieldValue(value any) (float64, bool) {
 	return 0, false
 }
 
+func boolField(m map[string]any, keys ...string) (bool, bool) {
+	switch typed := firstPresent(m, keys...).(type) {
+	case bool:
+		return typed, true
+	case string:
+		trimmed := strings.TrimSpace(typed)
+		if trimmed == "" {
+			return false, false
+		}
+		parsed, err := strconv.ParseBool(trimmed)
+		if err == nil {
+			return parsed, true
+		}
+	}
+	return false, false
+}
+
 func (h *Handler) persistCodexRefreshState(ctx context.Context, authID string, state codexRefreshState) error {
 	latest, ok := h.authManager.GetByID(authID)
 	if !ok || latest == nil {
@@ -918,6 +1018,7 @@ func (h *Handler) persistCodexRefreshState(ctx context.Context, authID string, s
 	latest.Metadata["exact_seven_day_refresh"] = state.ExactSevenDayRefresh
 	latest.Metadata["preheat_needed"] = state.PreheatNeeded
 	latest.Metadata["weekly_reset_at"] = state.WeeklyResetAt
+	latest.Metadata["weekly_gate_reset_at"] = state.WeeklyGateResetAt
 	latest.Metadata["fetched_at"] = state.FetchedAt
 	latest.UpdatedAt = time.Now().UTC()
 	_, err := h.authManager.Update(ctx, latest)
@@ -933,6 +1034,7 @@ func refreshStateFromAuth(auth *coreauth.Auth) codexRefreshState {
 	state.ExactSevenDayRefresh, _ = authFileBoolValue(auth.Metadata["exact_seven_day_refresh"])
 	state.PreheatNeeded, _ = authFileBoolValue(auth.Metadata["preheat_needed"])
 	state.WeeklyResetAt, _ = auth.Metadata["weekly_reset_at"].(string)
+	state.WeeklyGateResetAt, _ = auth.Metadata["weekly_gate_reset_at"].(string)
 	state.FetchedAt, _ = auth.Metadata["fetched_at"].(string)
 	return state
 }

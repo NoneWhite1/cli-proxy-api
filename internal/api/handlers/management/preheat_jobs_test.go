@@ -210,6 +210,83 @@ func TestNormalizeCodexUsageRefreshStateRejectsWeeklyWindow(t *testing.T) {
 	}
 }
 
+func TestPreheatJobRefreshTimeOperationUsesPlusFiveHourWindow(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	auth := &coreauth.Auth{ID: "codex-plus-refresh", Provider: "codex", Status: coreauth.StatusActive, Metadata: map[string]any{"type": "codex"}}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	now := time.Unix(1_700_000_000, 0).UTC()
+	fiveHourReset := now.Add(2 * time.Hour).UTC().Format(time.RFC3339)
+	weeklyGateReset := now.Add(72 * time.Hour).UTC().Format(time.RFC3339)
+	usage := map[string]any{
+		"plan_type": "plus",
+		"rate_limit": map[string]any{
+			"primary_window": map[string]any{
+				"limit_window_seconds": float64(604800),
+				"used_percent":         float64(100),
+				"reset_after_seconds":  float64(72 * 60 * 60),
+			},
+			"secondary_window": map[string]any{
+				"limit_window_seconds": float64(5 * 60 * 60),
+				"used_percent":         float64(100),
+				"reset_after_seconds":  float64(2 * 60 * 60),
+			},
+		},
+	}
+	h.preheatJobs.refreshHook = func(context.Context, *coreauth.Auth) (codexRefreshState, error) {
+		return normalizeCodexUsageRefreshState(usage, now)
+	}
+
+	snapshot := h.preheatJobs.startJob(preheatOperationRefreshTime, "manual", []*coreauth.Auth{auth})
+	waitForJobTerminal(t, h.preheatJobs, snapshot.ID)
+	stored, ok := h.preheatJobs.job(snapshot.ID)
+	if !ok || stored == nil {
+		t.Fatal("stored job missing")
+	}
+	if stored.Status != preheatJobStatusSucceeded {
+		t.Fatalf("refresh_time job status = %q, want %q; item=%+v", stored.Status, preheatJobStatusSucceeded, stored.Items[0])
+	}
+	state := stored.Items[0].RefreshState
+	if state == nil || !state.FetchedRefreshTime {
+		t.Fatalf("refresh state = %+v, want fetched state", state)
+	}
+	if state.WeeklyResetAt != fiveHourReset {
+		t.Fatalf("WeeklyResetAt = %q, want 5-hour reset %q", state.WeeklyResetAt, fiveHourReset)
+	}
+	if state.WeeklyGateResetAt != weeklyGateReset {
+		t.Fatalf("WeeklyGateResetAt = %q, want weekly gate reset %q", state.WeeklyGateResetAt, weeklyGateReset)
+	}
+}
+
+func TestPreheatAutoSkipsDueFiveHourWhenWeeklyGateFuture(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	now := time.Unix(1_700_000_000, 0).UTC()
+	record := &coreauth.Auth{
+		ID:       "codex-weekly-gated",
+		Provider: "codex",
+		Disabled: true,
+		Status:   coreauth.StatusDisabled,
+		Metadata: map[string]any{
+			"fetched_refresh_time":    true,
+			"exact_seven_day_refresh": true,
+			"preheat_needed":          true,
+			"weekly_gate_reset_at":    now.Add(time.Hour).UTC().Format(time.RFC3339),
+		},
+		Quota: coreauth.QuotaState{Exceeded: true, Reason: "codex_quota_auto_disabled", NextRecoverAt: now.Add(-time.Minute)},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	due := h.preheatJobs.dueAutoAuths(now)
+	if len(due) != 0 {
+		t.Fatalf("due auto auths = %d, want 0 while weekly gate is in the future", len(due))
+	}
+}
+
 func TestPersistCodexRefreshStateOnlyWritesRefreshStateFields(t *testing.T) {
 	manager := coreauth.NewManager(nil, nil, nil)
 	auth := &coreauth.Auth{
