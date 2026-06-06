@@ -206,7 +206,7 @@ const managementPreheatScript = `<script>
           if (document.getElementById("codex-preheat-style")) return;
           var style = document.createElement("style");
           style.id = "codex-preheat-style";
-          style.textContent = "#codex-preheat-panel{margin:12px 0 16px;padding:12px 14px;border:1px solid var(--border-color,#e3e1db);border-radius:12px;background:var(--floating-surface,#fffdf9);box-shadow:var(--shadow,0 1px 2px #00000014);display:flex;align-items:center;gap:10px;flex-wrap:wrap}#codex-preheat-panel button{height:34px;border:1px solid var(--primary-color,#8b8680);border-radius:8px;background:var(--primary-color,#8b8680);color:var(--primary-contrast,#fff);padding:0 12px;cursor:pointer}#codex-preheat-panel button[data-preheat-action='toggle-missing']{background:var(--bg-secondary,#f6f3ed);color:var(--text-primary,#2d2926)}#codex-preheat-panel button:disabled{cursor:not-allowed;opacity:.55}#codex-preheat-panel .codex-preheat-message{font-size:12px;color:var(--text-secondary,#6d6760)}#codex-preheat-panel .codex-preheat-message.success{color:var(--success-color,#10b981)}#codex-preheat-panel .codex-preheat-message.error{color:var(--error-color,#c65746)}#codex-preheat-panel .codex-preheat-counts{display:flex;gap:6px;flex-wrap:wrap;font-size:12px;color:var(--text-secondary,#6d6760)}#codex-preheat-panel .codex-preheat-pill,.codex-preheat-row-badge{border:1px solid var(--border-color,#e3e1db);border-radius:999px;background:var(--bg-secondary,#f6f3ed);padding:2px 8px;white-space:nowrap}.codex-preheat-row-badge{display:inline-flex;margin:4px 6px 4px 0;font-size:11px;color:var(--text-secondary,#6d6760)}.codex-preheat-row-badge.ready{border-color:var(--success-color,#10b981);color:var(--success-color,#10b981)}.codex-preheat-row-badge.scheduled{border-color:var(--primary-color,#8b8680);color:var(--text-primary,#2d2926)}";
+          style.textContent = "#codex-preheat-panel{margin:12px 0 16px;padding:12px 14px;border:1px solid var(--border-color,#e3e1db);border-radius:12px;background:var(--floating-surface,#fffdf9);box-shadow:var(--shadow,0 1px 2px #00000014);display:flex;align-items:center;gap:10px;flex-wrap:wrap}#codex-preheat-panel button{height:34px;border:1px solid var(--primary-color,#8b8680);border-radius:8px;background:var(--primary-color,#8b8680);color:var(--primary-contrast,#fff);padding:0 12px;cursor:pointer}#codex-preheat-panel button[data-preheat-action='toggle-missing']{background:var(--bg-secondary,#f6f3ed);color:var(--text-primary,#2d2926)}#codex-preheat-panel button:disabled{cursor:not-allowed;opacity:.55}#codex-preheat-panel .codex-preheat-message{font-size:12px;color:var(--text-secondary,#6d6760)}#codex-preheat-panel .codex-preheat-message.success{color:var(--success-color,#10b981)}#codex-preheat-panel .codex-preheat-message.error{color:var(--error-color,#c65746)}#codex-preheat-panel .codex-preheat-counts{display:flex;gap:6px;flex-wrap:wrap;font-size:12px;color:var(--text-secondary,#6d6760)}#codex-preheat-panel .codex-preheat-pill,.codex-preheat-row-badge{border:1px solid var(--border-color,#e3e1db);border-radius:999px;background:var(--bg-secondary,#f6f3ed);padding:2px 8px;white-space:nowrap}.codex-preheat-row-badge{display:inline-flex;margin:4px 6px 4px 0;font-size:11px;color:var(--text-secondary,#6d6760)}.codex-preheat-row-badge.ready{border-color:var(--success-color,#10b981);color:var(--success-color,#10b981)}.codex-preheat-row-badge.scheduled{border-color:var(--primary-color,#8b8680);color:var(--text-primary,#2d2926)}.codex-preheat-quota-visible [class*=\"quotaSection\"]{display:flex!important}";
           document.head.appendChild(style);
         }
 
@@ -485,9 +485,16 @@ const managementPreheatScript = `<script>
           });
         }
 
+        function isAuthFileSemanticCard(node) {
+          if (!node) return false;
+          var role = String(node.getAttribute ? node.getAttribute("role") : "").toLowerCase();
+          if (role === "row" || role === "listitem") return true;
+          return !!(node.querySelector && node.querySelector("[class*=\"quotaSection\"]") && (role === "article" || role === "group" || node.querySelector("[class*=\"cardActions\"]") || node.querySelector("[class*=\"cardHeader\"]")));
+        }
+
         function isAuthFileCard(node) {
           var className = node && node.className;
-          return classNameHasPrefix(className, "fileCard___") || classNameHasPrefix(className, "fileCardCompact___");
+          return classNameHasPrefix(className, "fileCard___") || classNameHasPrefix(className, "fileCardCompact___") || isAuthFileSemanticCard(node);
         }
 
         function isAuthFileRow(node) {
@@ -498,7 +505,7 @@ const managementPreheatScript = `<script>
         function authContainerForCheckbox(checkbox, file) {
           var node = checkbox;
           while (node && node !== document.body) {
-            if (file && (isAuthFileCard(node) || isAuthFileRow(node)) && rowTextMatchesFile(node, file)) return node;
+            if (file && (isAuthFileCard(node) || isAuthFileRow(node) || isAuthFileSemanticCard(node)) && rowTextMatchesFile(node, file)) return node;
             node = node.parentElement;
           }
           return null;
@@ -506,6 +513,10 @@ const managementPreheatScript = `<script>
 
         function authRowForCheckbox(checkbox) {
           return authContainerForCheckbox(checkbox, fileForCheckbox(checkbox));
+        }
+
+        function markAuthRowForQuotaVisibility(row) {
+          if (row && row.classList && !row.classList.contains("codex-preheat-quota-visible")) row.classList.add("codex-preheat-quota-visible");
         }
 
         function updateAuthRowDecorations() {
@@ -516,6 +527,7 @@ const managementPreheatScript = `<script>
             var row = authRowForCheckbox(checkbox);
             if (!file || !row) return;
             var index = authIndexOf(file);
+            markAuthRowForQuotaVisibility(row);
             if (index && state.selectedAuthFiles[index] && !checkbox.checked) checkbox.checked = true;
             var refresh = refreshStateFor(file);
             var badge = row.querySelector(".codex-preheat-row-badge");
@@ -543,6 +555,9 @@ const managementPreheatScript = `<script>
               row.style.display = row.__cliproxyCodexPreheatDisplay;
               delete row.__cliproxyCodexPreheatDisplay;
             }
+          });
+          Array.prototype.slice.call(document.querySelectorAll(".codex-preheat-quota-visible")).forEach(function (row) {
+            row.classList.remove("codex-preheat-quota-visible");
           });
         }
 
@@ -834,12 +849,31 @@ func injectManagementPreheatPanel(html []byte) []byte {
 	if len(html) == 0 {
 		return html
 	}
+	html = patchManagementBundle(html)
 	if bytes.Contains(html, []byte(managementPreheatScript)) {
 		return html
 	}
 
 	html = removeManagementPreheatScripts(html)
 	return appendManagementPreheatScript(html)
+}
+
+func patchManagementBundle(html []byte) []byte {
+	oldFilterCompactGuard := []byte("T=l&&Nx(n)===l?l:null,E=!!T&&!y&&!r")
+	oldFilterGuard := []byte("T=l&&Nx(n)===l?l:null,E=!!T&&!y")
+	newProviderGuard := []byte("T=Nx(n),E=!!T&&!y")
+	html = bytes.ReplaceAll(html, oldFilterCompactGuard, newProviderGuard)
+	html = bytes.ReplaceAll(html, oldFilterGuard, newProviderGuard)
+
+	oldGuard := []byte("E=!!T&&!y&&!r")
+	newGuard := []byte("E=!!T&&!y")
+	html = bytes.ReplaceAll(html, oldGuard, newGuard)
+
+	oldCSS := []byte(".AuthFilesPage-module__fileCardCompact___u9yZu .AuthFilesPage-module__quotaSection___hXy5f{display:none}")
+	newCSS := []byte(".AuthFilesPage-module__fileCardCompact___u9yZu .AuthFilesPage-module__quotaSection___hXy5f{display:flex}")
+	html = bytes.ReplaceAll(html, oldCSS, newCSS)
+
+	return html
 }
 
 func removeManagementPreheatScripts(html []byte) []byte {

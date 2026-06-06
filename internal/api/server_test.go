@@ -245,6 +245,75 @@ func TestManagementControlPanelReplacesStalePreheatScriptFromStaticPath(t *testi
 	}
 }
 
+func TestInjectManagementPreheatPanelPatchesCompactQuotaBundle(t *testing.T) {
+	compactQuotaGuard := `T=l&&Nx(n)===l?l:null,E=!!T&&!y&&!r,D=1;`
+	compactQuotaCSS := `.AuthFilesPage-module__fileCardCompact___u9yZu .AuthFilesPage-module__quotaSection___hXy5f{display:none}`
+	input := []byte(`<!doctype html><html><head><script>` + compactQuotaGuard + `</script><style>` + compactQuotaCSS + `.AuthFilesPage-module__quotaMessageAction___9r9cq{cursor:pointer}</style></head><body><div>点击此处刷新额度</div></body></html>`)
+	out := string(injectManagementPreheatPanel(input))
+
+	if strings.Contains(out, `T=l&&Nx(n)===l?l:null`) {
+		t.Fatalf("auth-file quota render guard still depends on the active provider filter: %s", out)
+	}
+	if !strings.Contains(out, `T=Nx(n),E=!!T&&!y,D=1`) {
+		t.Fatalf("auth-file quota render guard was not patched to render quota-capable provider cards: %s", out)
+	}
+	if strings.Contains(out, `E=!!T&&!y&&!r`) {
+		t.Fatalf("compact quota render guard still excludes compact cards: %s", out)
+	}
+	if strings.Contains(out, compactQuotaCSS) {
+		t.Fatalf("compact quota CSS still hides the quota section: %s", out)
+	}
+	if !strings.Contains(out, `.AuthFilesPage-module__fileCardCompact___u9yZu .AuthFilesPage-module__quotaSection___hXy5f{display:flex}`) {
+		t.Fatalf("compact quota CSS was not patched visible: %s", out)
+	}
+	for _, token := range []string{`点击此处刷新额度`, `quotaMessageAction___9r9cq`, `window.__cliproxyCodexPreheat`} {
+		if !strings.Contains(out, token) {
+			t.Fatalf("patched management HTML should retain native quota token %q", token)
+		}
+	}
+}
+
+func TestInjectManagementPreheatPanelPatchesExistingCurrentScriptHTML(t *testing.T) {
+	input := []byte(`<!doctype html><html><body><script>T=l&&Nx(n)===l?l:null,E=!!T&&!y&&!r,D=1;</script>` + managementPreheatScript + `</body></html>`)
+	out := string(injectManagementPreheatPanel(input))
+
+	if strings.Contains(out, `T=l&&Nx(n)===l?l:null`) {
+		t.Fatalf("existing current preheat script HTML should still receive provider-independent quota bundle patch: %s", out)
+	}
+	if strings.Contains(out, `E=!!T&&!y&&!r`) {
+		t.Fatalf("existing current preheat script HTML should still receive compact quota bundle patch: %s", out)
+	}
+	if !strings.Contains(out, `T=Nx(n),E=!!T&&!y,D=1`) {
+		t.Fatalf("existing current preheat script HTML missing patched compact quota guard: %s", out)
+	}
+	if strings.Count(out, `window.__cliproxyCodexPreheat`) != 2 {
+		t.Fatalf("existing current preheat script should not be duplicated; marker count = %d", strings.Count(out, `window.__cliproxyCodexPreheat`))
+	}
+}
+
+func TestInjectManagementPreheatPanelPatchesCurrentManagementBundleQuotaCards(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "static", "management.html"))
+	if err != nil {
+		t.Fatalf("failed to read current management bundle: %v", err)
+	}
+	out := string(injectManagementPreheatPanel(data))
+
+	if strings.Contains(out, `T=l&&Nx(n)===l?l:null`) {
+		t.Fatalf("current management bundle should not require the active auth-files filter before rendering quota cards")
+	}
+	if strings.Contains(out, `E=!!T&&!y&&!r`) {
+		t.Fatalf("current management bundle should not suppress quota cards in compact mode")
+	}
+	if strings.Contains(out, `.AuthFilesPage-module__fileCardCompact___u9yZu .AuthFilesPage-module__quotaSection___hXy5f{display:none}`) {
+		t.Fatalf("current management bundle should not hide compact quota sections")
+	}
+	for _, token := range []string{`T=Nx(n),E=!!T&&!y`, `.AuthFilesPage-module__fileCardCompact___u9yZu .AuthFilesPage-module__quotaSection___hXy5f{display:flex}`, `点击此处刷新额度`, `window.__cliproxyCodexPreheat`} {
+		if !strings.Contains(out, token) {
+			t.Fatalf("current management bundle missing patched quota token %q", token)
+		}
+	}
+}
+
 func TestManagementPreheatPanelRefreshesAfterAuthFileMutation(t *testing.T) {
 	script := managementPreheatScript
 	if !strings.Contains(script, `function refreshAuthFilesSoon`) {
@@ -606,6 +675,27 @@ func TestManagementPreheatPanelWalksSelectionAncestors(t *testing.T) {
 		if !strings.Contains(script, token) {
 			t.Fatalf("preheat script should resolve and hide whole credential cards; missing %q", token)
 		}
+	}
+}
+
+func TestManagementPreheatPanelHandlesStyledCompactCardsVisibly(t *testing.T) {
+	script := managementPreheatScript
+	for _, token := range []string{
+		`function isAuthFileSemanticCard`,
+		`quotaSection`,
+		`cardActions`,
+		`cardHeader`,
+		`.codex-preheat-quota-visible [class*=\"quotaSection\"]`,
+		`display:flex!important`,
+		`function markAuthRowForQuotaVisibility`,
+		`markAuthRowForQuotaVisibility(row)`,
+	} {
+		if !strings.Contains(script, token) {
+			t.Fatalf("preheat script should add robust structural fallback and quota visibility styles for styled cards; missing %q", token)
+		}
+	}
+	if strings.Count(script, `row.classList.add("codex-preheat-quota-visible")`) != 1 {
+		t.Fatalf("preheat script should add quota visibility only through the row-scoped helper")
 	}
 }
 
