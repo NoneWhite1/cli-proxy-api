@@ -217,6 +217,73 @@ func TestManager_CodexQuotaRecoveryLoopRecoversDueAutoDisabledCredential(t *test
 	}
 }
 
+func TestManager_CodexQuotaRecoveryLoopUsesRefreshTimeWithoutPreheat(t *testing.T) {
+	store := &quotaDisableStore{}
+	m := NewManager(store, nil, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m.StartAutoRefresh(ctx, time.Hour)
+	defer m.StopAutoRefresh()
+
+	resetAt := time.Now().Add(750 * time.Millisecond).UTC()
+	if _, errRegister := m.Register(ctx, &Auth{
+		ID:       "codex-refresh-no-preheat",
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"access_token":            "token",
+			"fetched_refresh_time":    true,
+			"exact_seven_day_refresh": false,
+			"preheat_needed":          false,
+			"weekly_reset_at":         resetAt.Format(time.RFC3339Nano),
+		},
+	}); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	store.saved = nil
+
+	retryAfter := 25 * time.Millisecond
+	m.MarkResult(ctx, Result{
+		AuthID:     "codex-refresh-no-preheat",
+		Provider:   "codex",
+		Model:      "gpt-5",
+		Success:    false,
+		RetryAfter: &retryAfter,
+		Error: &Error{
+			HTTPStatus: http.StatusTooManyRequests,
+			Message:    `{"error":{"type":"usage_limit_reached","message":"usage limit reached"}}`,
+		},
+	})
+
+	disabled, ok := m.GetByID("codex-refresh-no-preheat")
+	if !ok || disabled == nil {
+		t.Fatal("expected auth to be present")
+	}
+	if !disabled.Disabled || disabled.Status != StatusDisabled {
+		t.Fatalf("disabled state = disabled:%v status:%q, want auto-disabled", disabled.Disabled, disabled.Status)
+	}
+	if !disabled.Quota.NextRecoverAt.Equal(resetAt) {
+		t.Fatalf("next recover at = %s, want fetched weekly reset %s", disabled.Quota.NextRecoverAt, resetAt)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	stillDisabled, ok := m.GetByID("codex-refresh-no-preheat")
+	if !ok || stillDisabled == nil {
+		t.Fatal("expected auth to be present before reset")
+	}
+	if !stillDisabled.Disabled || stillDisabled.Status != StatusDisabled {
+		t.Fatalf("credential recovered before fetched refresh time: disabled=%v status=%q", stillDisabled.Disabled, stillDisabled.Status)
+	}
+
+	waitForQuotaRecoveryCondition(t, 2*time.Second, func() bool {
+		updated, okUpdated := m.GetByID("codex-refresh-no-preheat")
+		return okUpdated && updated != nil && !updated.Disabled && updated.Status == StatusActive && !updated.Quota.Exceeded && updated.Quota.Reason == ""
+	})
+	if latest := store.latest(); latest == nil || latest.Disabled || latest.Status != StatusActive || latest.Quota.Exceeded {
+		t.Fatalf("persisted recovery = %#v, want active credential with cleared quota", latest)
+	}
+}
+
 func TestManager_CodexQuotaRecoveryLoopKeepsNotDueCredentialDisabled(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())

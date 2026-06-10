@@ -2700,6 +2700,9 @@ func autoQuotaRecoveryAt(auth *Auth) (time.Time, bool) {
 	if recoverAt.IsZero() || (!auth.NextRetryAfter.IsZero() && auth.NextRetryAfter.After(recoverAt)) {
 		recoverAt = auth.NextRetryAfter
 	}
+	if refreshAt, ok := codexRefreshResetAtWithoutPreheat(auth); ok {
+		recoverAt = refreshAt
+	}
 	if recoverAt.IsZero() {
 		return time.Time{}, false
 	}
@@ -2707,6 +2710,33 @@ func autoQuotaRecoveryAt(auth *Auth) (time.Time, bool) {
 		recoverAt = gateAt
 	}
 	return recoverAt, true
+}
+
+func codexRefreshResetAtWithoutPreheat(auth *Auth) (time.Time, bool) {
+	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") || auth.Metadata == nil {
+		return time.Time{}, false
+	}
+	fetched, ok := parseBoolAny(auth.Metadata["fetched_refresh_time"])
+	if !ok || !fetched {
+		return time.Time{}, false
+	}
+	preheatNeeded, ok := parseBoolAny(auth.Metadata["preheat_needed"])
+	if !ok || preheatNeeded {
+		return time.Time{}, false
+	}
+	if exactSevenDay, ok := parseBoolAny(auth.Metadata["exact_seven_day_refresh"]); ok && exactSevenDay {
+		return time.Time{}, false
+	}
+	value, _ := auth.Metadata["weekly_reset_at"].(string)
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}, false
+	}
+	resetAt, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil || resetAt.IsZero() {
+		return time.Time{}, false
+	}
+	return resetAt.UTC(), true
 }
 
 func codexWeeklyGateResetAt(auth *Auth) (time.Time, bool) {
@@ -3299,6 +3329,9 @@ func markAuthAutoDisabledForQuota(auth *Auth, state *ModelState, retryAfter *tim
 			recoverAt = now.Add(cooldown)
 		}
 		backoffLevel = nextLevel
+	}
+	if refreshAt, ok := codexRefreshResetAtWithoutPreheat(auth); ok {
+		recoverAt = refreshAt
 	}
 	if gateAt, ok := codexWeeklyGateResetAt(auth); ok && gateAt.After(recoverAt) {
 		recoverAt = gateAt
