@@ -3,6 +3,7 @@ package management
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -284,6 +285,200 @@ func TestPreheatAutoSkipsDueFiveHourWhenWeeklyGateFuture(t *testing.T) {
 	due := h.preheatJobs.dueAutoAuths(now)
 	if len(due) != 0 {
 		t.Fatalf("due auto auths = %d, want 0 while weekly gate is in the future", len(due))
+	}
+}
+
+func TestPreheatAutoRunsDueAutoDisabledCodexAuthAtFetchedRefreshTime(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	now := time.Now().UTC()
+	recoverAt := now.Add(-time.Minute)
+	auth := &coreauth.Auth{
+		ID:             "codex-auto-due",
+		Provider:       "codex",
+		Disabled:       true,
+		Status:         coreauth.StatusDisabled,
+		StatusMessage:  "disabled after quota exhausted",
+		NextRetryAfter: recoverAt,
+		Metadata: map[string]any{
+			"fetched_refresh_time":    true,
+			"exact_seven_day_refresh": false,
+			"preheat_needed":          false,
+			"weekly_reset_at":         recoverAt.Format(time.RFC3339),
+		},
+		Quota: coreauth.QuotaState{Exceeded: true, Reason: "codex_quota_auto_disabled", NextRecoverAt: recoverAt},
+	}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	var preheatCalls int
+	h.preheatJobs.preheatHook = func(_ context.Context, got *coreauth.Auth) error {
+		if got == nil || got.ID != auth.ID {
+			return fmt.Errorf("preheat auth = %v, want %s", got, auth.ID)
+		}
+		if got.Disabled || got.Status == coreauth.StatusDisabled {
+			return fmt.Errorf("preheat auth remained disabled: disabled=%v status=%q", got.Disabled, got.Status)
+		}
+		preheatCalls++
+		return nil
+	}
+	h.preheatJobs.refreshHook = func(_ context.Context, got *coreauth.Auth) (codexRefreshState, error) {
+		if got == nil || got.ID != auth.ID {
+			return codexRefreshState{}, fmt.Errorf("refresh auth = %v, want %s", got, auth.ID)
+		}
+		return codexRefreshState{
+			FetchedRefreshTime:   true,
+			ExactSevenDayRefresh: false,
+			PreheatNeeded:        false,
+			WeeklyResetAt:        now.Add(time.Hour).UTC().Format(time.RFC3339),
+			FetchedAt:            now.UTC().Format(time.RFC3339),
+		}, nil
+	}
+
+	h.preheatJobs.mu.Lock()
+	h.preheatJobs.auto.Enabled = true
+	h.preheatJobs.mu.Unlock()
+	h.preheatJobs.scanAutoNow()
+
+	auto := h.preheatJobs.autoSnapshot()
+	if auto.LastJobID == "" {
+		t.Fatal("auto scan did not start a job")
+	}
+	waitForJobTerminal(t, h.preheatJobs, auto.LastJobID)
+	job, ok := h.preheatJobs.job(auto.LastJobID)
+	if !ok || job == nil {
+		t.Fatal("auto job missing")
+	}
+	if job.Operation != preheatOperationPreheatRefresh || job.Source != "auto" || job.Status != preheatJobStatusSucceeded {
+		t.Fatalf("auto job = operation %q source %q status %q, want auto preheat_refresh succeeded", job.Operation, job.Source, job.Status)
+	}
+	if preheatCalls != 1 {
+		t.Fatalf("preheat calls = %d, want 1", preheatCalls)
+	}
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatal("updated auth missing")
+	}
+	if updated.Disabled || updated.Status != coreauth.StatusActive || updated.Quota.Exceeded || updated.Quota.Reason != "" || !updated.NextRetryAfter.IsZero() {
+		t.Fatalf("updated auth = disabled:%v status:%q quota:%+v nextRetry:%s, want active with cleared quota", updated.Disabled, updated.Status, updated.Quota, updated.NextRetryAfter)
+	}
+}
+
+func TestPreheatAutoRunsQueuedSecondItemWhenFirstItemDeduped(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	now := time.Now().UTC()
+	recoverAt := now.Add(-time.Minute)
+	busy := &coreauth.Auth{ID: "codex-busy", Provider: "codex", Status: coreauth.StatusActive, Metadata: map[string]any{"type": "codex"}}
+	dueSecond := &coreauth.Auth{
+		ID:             "codex-due-second",
+		Provider:       "codex",
+		Disabled:       true,
+		Status:         coreauth.StatusDisabled,
+		StatusMessage:  "disabled after quota exhausted",
+		NextRetryAfter: recoverAt,
+		Metadata: map[string]any{
+			"fetched_refresh_time":    true,
+			"exact_seven_day_refresh": false,
+			"preheat_needed":          false,
+			"weekly_reset_at":         recoverAt.Format(time.RFC3339),
+		},
+		Quota: coreauth.QuotaState{Exceeded: true, Reason: "codex_quota_auto_disabled", NextRecoverAt: recoverAt},
+	}
+	if _, errRegister := manager.Register(context.Background(), busy); errRegister != nil {
+		t.Fatalf("register busy auth: %v", errRegister)
+	}
+	if _, errRegister := manager.Register(context.Background(), dueSecond); errRegister != nil {
+		t.Fatalf("register due auth: %v", errRegister)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	busyStarted := make(chan struct{})
+	releaseBusy := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-releaseBusy:
+		default:
+			close(releaseBusy)
+		}
+	})
+	var busyStartedOnce sync.Once
+	var callsMu sync.Mutex
+	duePreheatCalls := 0
+	h.preheatJobs.preheatHook = func(_ context.Context, auth *coreauth.Auth) error {
+		if auth == nil {
+			return fmt.Errorf("preheat auth is nil")
+		}
+		switch auth.ID {
+		case busy.ID:
+			busyStartedOnce.Do(func() { close(busyStarted) })
+			<-releaseBusy
+			return nil
+		case dueSecond.ID:
+			callsMu.Lock()
+			duePreheatCalls++
+			callsMu.Unlock()
+			return nil
+		default:
+			return fmt.Errorf("unexpected preheat auth %q", auth.ID)
+		}
+	}
+	h.preheatJobs.refreshHook = func(_ context.Context, auth *coreauth.Auth) (codexRefreshState, error) {
+		if auth == nil || auth.ID != dueSecond.ID {
+			return codexRefreshState{}, fmt.Errorf("refresh auth = %v, want %s", auth, dueSecond.ID)
+		}
+		return codexRefreshState{
+			FetchedRefreshTime:   true,
+			ExactSevenDayRefresh: false,
+			PreheatNeeded:        false,
+			WeeklyResetAt:        now.Add(time.Hour).UTC().Format(time.RFC3339),
+			FetchedAt:            now.UTC().Format(time.RFC3339),
+		}, nil
+	}
+
+	busyJob := h.preheatJobs.startJob(preheatOperationPreheat, "manual", []*coreauth.Auth{busy})
+	select {
+	case <-busyStarted:
+	case <-time.After(time.Second):
+		t.Fatal("busy preheat job did not start")
+	}
+
+	autoJob := h.preheatJobs.startJob(preheatOperationPreheatRefresh, "auto", []*coreauth.Auth{busy, dueSecond})
+	if len(autoJob.Items) != 2 {
+		t.Fatalf("auto job items = %d, want 2", len(autoJob.Items))
+	}
+	if autoJob.Items[0].Status != preheatJobStatusSkipped || !autoJob.Items[0].Deduped {
+		t.Fatalf("first auto item = status %q deduped %v, want skipped deduped", autoJob.Items[0].Status, autoJob.Items[0].Deduped)
+	}
+	if autoJob.Items[1].Status != preheatJobStatusQueued {
+		t.Fatalf("second auto item = status %q, want queued", autoJob.Items[1].Status)
+	}
+
+	close(releaseBusy)
+	waitForJobTerminal(t, h.preheatJobs, autoJob.ID)
+	waitForJobTerminal(t, h.preheatJobs, busyJob.ID)
+	stored, ok := h.preheatJobs.job(autoJob.ID)
+	if !ok || stored == nil || len(stored.Items) != 2 {
+		t.Fatalf("stored auto job missing or malformed: %#v", stored)
+	}
+	if stored.Items[0].Status != preheatJobStatusSkipped {
+		t.Fatalf("first auto item status = %q, want skipped", stored.Items[0].Status)
+	}
+	if stored.Items[1].Status != preheatJobStatusSucceeded {
+		t.Fatalf("second auto item status = %q, want succeeded", stored.Items[1].Status)
+	}
+	callsMu.Lock()
+	gotDuePreheatCalls := duePreheatCalls
+	callsMu.Unlock()
+	if gotDuePreheatCalls != 1 {
+		t.Fatalf("due second preheat calls = %d, want 1", gotDuePreheatCalls)
+	}
+	updated, ok := manager.GetByID(dueSecond.ID)
+	if !ok || updated == nil {
+		t.Fatal("updated due auth missing")
+	}
+	if updated.Disabled || updated.Status != coreauth.StatusActive || updated.Quota.Exceeded || updated.Quota.Reason != "" || !updated.NextRetryAfter.IsZero() {
+		t.Fatalf("updated due auth = disabled:%v status:%q quota:%+v nextRetry:%s, want active with cleared quota", updated.Disabled, updated.Status, updated.Quota, updated.NextRetryAfter)
 	}
 }
 

@@ -309,7 +309,7 @@ func (m *preheatJobManager) runJob(ctx context.Context, jobID string) {
 	})
 
 	var wg sync.WaitGroup
-	for idx := range m.itemsForRun(jobID) {
+	for _, idx := range m.itemsForRun(jobID) {
 		idx := idx
 		wg.Add(1)
 		go func() {
