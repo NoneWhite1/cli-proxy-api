@@ -40,6 +40,9 @@ func TestCloneForRuntimeDeepCopiesConfig(t *testing.T) {
 	if clone.OAuthModelAlias["codex"][0].Alias != "client-model" {
 		t.Fatalf("clone.OAuthModelAlias[codex][0].Alias = %q, want client-model", clone.OAuthModelAlias["codex"][0].Alias)
 	}
+	if clone.Codex.AccountTypeModels["plus"][0] != "gpt-5.6-sol" {
+		t.Fatalf("clone.Codex.AccountTypeModels[plus][0] = %q, want gpt-5.6-sol", clone.Codex.AccountTypeModels["plus"][0])
+	}
 	if got := pluginRawScalar(t, clone.Plugins.Configs["sample"].Raw, "mode"); got != "first" {
 		t.Fatalf("clone plugin raw mode = %q, want first", got)
 	}
@@ -53,6 +56,7 @@ func TestCloneForRuntimeDeepCopiesConfig(t *testing.T) {
 	clone.APIKeys[0] = "clone-client-key"
 	clone.OAuthExcludedModels["codex"][0] = "clone-hidden-model"
 	clone.OAuthModelAlias["codex"][0].Alias = "clone-client-model"
+	clone.Codex.AccountTypeModels["plus"][0] = "clone-gpt-5.6-sol"
 	clone.OpenAICompatibility[0].Models[0].Thinking.Levels[0] = "clone-low"
 	clone.Payload.Default[0].Params["object"].(map[string]any)["key"] = "clone-value"
 	plugin := clone.Plugins.Configs["sample"]
@@ -67,6 +71,9 @@ func TestCloneForRuntimeDeepCopiesConfig(t *testing.T) {
 	}
 	if cfg.OAuthModelAlias["codex"][0].Alias != "mutated-client-model" {
 		t.Fatalf("cfg.OAuthModelAlias[codex][0].Alias = %q, want mutated-client-model", cfg.OAuthModelAlias["codex"][0].Alias)
+	}
+	if cfg.Codex.AccountTypeModels["plus"][0] != "mutated-gpt-5.6-sol" {
+		t.Fatalf("cfg.Codex.AccountTypeModels[plus][0] = %q, want mutated-gpt-5.6-sol", cfg.Codex.AccountTypeModels["plus"][0])
 	}
 	if got := pluginRawScalar(t, cfg.Plugins.Configs["sample"].Raw, "mode"); got != "second" {
 		t.Fatalf("cfg plugin raw mode = %q, want second", got)
@@ -171,6 +178,11 @@ func sampleCloneRuntimeConfig() *Config {
 		OAuthModelAlias: map[string][]OAuthModelAlias{
 			"codex": {{Name: "upstream-model", Alias: "client-model", Fork: true}},
 		},
+		Codex: CodexConfig{
+			AccountTypeModels: map[string][]string{
+				"plus": {"gpt-5.6-sol"},
+			},
+		},
 		Payload: PayloadConfig{
 			Default: []PayloadRule{{
 				Models: []PayloadModelRule{{
@@ -197,6 +209,7 @@ func mutateOriginalConfig(cfg *Config) {
 	cfg.APIKeys[0] = "mutated-client-key"
 	cfg.OAuthExcludedModels["codex"][0] = "mutated-hidden-model"
 	cfg.OAuthModelAlias["codex"][0].Alias = "mutated-client-model"
+	cfg.Codex.AccountTypeModels["plus"][0] = "mutated-gpt-5.6-sol"
 	cfg.OpenAICompatibility[0].Models[0].Thinking.Levels[0] = "mutated-low"
 	cfg.Payload.Default[0].Params["object"].(map[string]any)["key"] = "mutated-value"
 	plugin := cfg.Plugins.Configs["sample"]

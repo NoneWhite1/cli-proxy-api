@@ -280,6 +280,26 @@ type CodexHeaderDefaults struct {
 // CodexConfig configures provider-wide Codex request behavior.
 type CodexConfig struct {
 	IdentityConfuse bool `yaml:"identity-confuse" json:"identity-confuse"`
+
+	// AccountTypeModels optionally restricts the models registered for OAuth Codex
+	// accounts of each detected account type. Every configured list is an allowlist;
+	// an empty list disables all models for that account type.
+	AccountTypeModels map[string][]string `yaml:"account-type-models,omitempty" json:"account-type-models,omitempty"`
+}
+
+// ModelsForAccountType returns the configured Codex model allowlist for an
+// account type. Account type keys are matched case-insensitively.
+func (c CodexConfig) ModelsForAccountType(accountType string) ([]string, bool) {
+	accountType = strings.ToLower(strings.TrimSpace(accountType))
+	if accountType == "" {
+		return nil, false
+	}
+	for configuredType, models := range c.AccountTypeModels {
+		if strings.EqualFold(strings.TrimSpace(configuredType), accountType) {
+			return append([]string(nil), models...), true
+		}
+	}
+	return nil, false
 }
 
 // TLSConfig holds HTTPS server settings.

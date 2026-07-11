@@ -184,6 +184,16 @@ codex:
   # Some superstitious users believe request tracking identifiers can be used
   # as evidence for TOS enforcement bans; this option only satisfies those odd concerns.
   identity-confuse: false
+  # Optionally limit OAuth Codex accounts by detected account type. Each configured
+  # list is a strict allowlist; requests for another model are routed to an eligible
+  # account of a different type. Account type names are case-insensitive.
+  # account-type-models:
+  #   plus:
+  #     - "gpt-5.6-sol"
+  #   free:
+  #     - "gpt-5.6-terra"
+  # An empty list disables all models for that account type:
+  #   free: []
 
 # When true, enable authentication for the WebSocket API (/v1/ws).
 ws-auth: true

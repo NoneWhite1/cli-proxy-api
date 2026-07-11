@@ -279,6 +279,26 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 	expectContains(t, details, "remote-management.secret-key: deleted")
 }
 
+func TestBuildConfigChangeDetails_CodexAccountTypeModels(t *testing.T) {
+	oldCfg := &config.Config{
+		Codex: config.CodexConfig{
+			AccountTypeModels: map[string][]string{
+				"plus": {"gpt-5.6-sol"},
+			},
+		},
+	}
+	newCfg := &config.Config{
+		Codex: config.CodexConfig{
+			AccountTypeModels: map[string][]string{
+				"plus": {"gpt-5.6-sol", "gpt-5.6-terra"},
+			},
+		},
+	}
+
+	details := BuildConfigChangeDetails(oldCfg, newCfg)
+	expectContains(t, details, "codex.account-type-models: updated")
+}
+
 func TestBuildConfigChangeDetails_AllBranches(t *testing.T) {
 	oldCfg := &config.Config{
 		Port:                          1,

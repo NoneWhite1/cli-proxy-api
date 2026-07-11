@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -1231,6 +1232,15 @@ func (s *Service) tryRegisterPluginModelsForAuth(ctx context.Context, a *coreaut
 		}
 	}
 	models := applyExcludedModels(result.Models, activeExcluded)
+	if providerKey == "codex" && s.cfg != nil {
+		accountType := coreauth.CodexAccountTypeFromAuth(activeAuth)
+		if accountType == "" {
+			accountType = coreauth.CodexAccountTypeFromAuth(a)
+		}
+		if allowedModels, configured := s.cfg.Codex.ModelsForAccountType(accountType); configured {
+			models = applyAllowedModels(models, allowedModels)
+		}
+	}
 	models = applyOAuthModelAliasForAuth(s.cfg, providerKey, activeAuthKind, activeAuth.Attributes, models)
 	if len(models) > 0 {
 		s.registerResolvedModelsForAuth(activeAuth, providerKey, applyModelPrefixes(models, activeAuth.Prefix, s.cfg != nil && s.cfg.ForceModelPrefix))
@@ -1259,11 +1269,13 @@ func (s *Service) applyConfigUpdateWithAuthSynthesis(newCfg *config.Config, synt
 	previousStrategy := ""
 	var previousSessionAffinity bool
 	var previousSessionAffinityTTL string
+	var previousCodexAccountTypeModels map[string][]string
 	s.cfgMu.RLock()
 	if s.cfg != nil {
 		previousStrategy = strings.ToLower(strings.TrimSpace(s.cfg.Routing.Strategy))
 		previousSessionAffinity = s.cfg.Routing.SessionAffinity
 		previousSessionAffinityTTL = s.cfg.Routing.SessionAffinityTTL
+		previousCodexAccountTypeModels = s.cfg.Codex.AccountTypeModels
 	}
 	s.cfgMu.RUnlock()
 
@@ -1290,6 +1302,7 @@ func (s *Service) applyConfigUpdateWithAuthSynthesis(newCfg *config.Config, synt
 
 	nextSessionAffinity := newCfg.Routing.SessionAffinity
 	nextSessionAffinityTTL := newCfg.Routing.SessionAffinityTTL
+	codexAccountTypeModelsChanged := !reflect.DeepEqual(previousCodexAccountTypeModels, newCfg.Codex.AccountTypeModels)
 
 	selectorChanged := previousStrategy != nextStrategy ||
 		previousSessionAffinity != nextSessionAffinity ||
@@ -1353,6 +1366,31 @@ func (s *Service) applyConfigUpdateWithAuthSynthesis(newCfg *config.Config, synt
 		}
 	}
 	s.syncPluginModelRuntime(ctx)
+	if codexAccountTypeModelsChanged {
+		s.refreshCodexAccountTypeModelRegistrations(auths)
+	}
+}
+
+func (s *Service) refreshCodexAccountTypeModelRegistrations(auths []*coreauth.Auth) {
+	if s == nil || s.coreManager == nil || len(auths) == 0 {
+		return
+	}
+
+	tasks := make([]modelRegistrationTask, 0, len(auths))
+	for _, auth := range auths {
+		if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") || auth.AuthKind() == coreauth.AuthKindAPIKey {
+			continue
+		}
+		authForRefresh := auth.Clone()
+		tasks = append(tasks, modelRegistrationTask{
+			phase:    modelRegistrationPhase(authForRefresh),
+			category: modelRegistrationCategory(authForRefresh),
+			run: func(compatCache *openAICompatibilityRegistrationCache) {
+				s.refreshModelRegistrationForAuthWithCache(authForRefresh, compatCache)
+			},
+		})
+	}
+	s.runModelRegistrationTasks(context.Background(), tasks)
 }
 
 func (s *Service) reloadConfigFromWatcher() bool {
@@ -1943,6 +1981,8 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 		return
 	}
 	var models []*ModelInfo
+	var codexAccountTypeModels []string
+	var codexAccountTypeModelsConfigured bool
 	switch provider {
 	case constant.Gemini:
 		models = registry.GetGeminiModels()
@@ -1997,21 +2037,10 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 		}
 		models = applyExcludedModels(models, excluded)
 	case "codex":
-		codexPlanType := ""
-		if a.Attributes != nil {
-			codexPlanType = strings.TrimSpace(a.Attributes["plan_type"])
-		}
-		switch strings.ToLower(codexPlanType) {
-		case "pro":
-			models = registry.GetCodexProModels()
-		case "plus":
-			models = registry.GetCodexPlusModels()
-		case "team", "business", "go":
-			models = registry.GetCodexTeamModels()
-		case "free":
-			models = registry.GetCodexFreeModels()
-		default:
-			models = registry.GetCodexProModels()
+		accountType := coreauth.CodexAccountTypeFromAuth(a)
+		models = codexModelsForAccountType(accountType)
+		if s.cfg != nil {
+			codexAccountTypeModels, codexAccountTypeModelsConfigured = s.cfg.Codex.ModelsForAccountType(accountType)
 		}
 		if entry := s.resolveConfigCodexKey(a); entry != nil {
 			if len(entry.Models) > 0 {
@@ -2128,18 +2157,39 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 			}
 		}
 	}
-	models = applyOAuthModelAliasForAuth(s.cfg, provider, authKind, a.Attributes, models)
 	key := provider
 	if key == "" {
 		key = strings.ToLower(strings.TrimSpace(a.Provider))
 	}
-	models = s.appendPluginModels(key, models)
+	if codexAccountTypeModelsConfigured {
+		models = s.appendPluginModels(key, models)
+		models = applyAllowedModels(models, codexAccountTypeModels)
+		models = applyOAuthModelAliasForAuth(s.cfg, provider, authKind, a.Attributes, models)
+	} else {
+		models = applyOAuthModelAliasForAuth(s.cfg, provider, authKind, a.Attributes, models)
+		models = s.appendPluginModels(key, models)
+	}
 	if len(models) > 0 {
 		s.registerResolvedModelsForAuth(a, key, applyModelPrefixes(models, a.Prefix, s.cfg != nil && s.cfg.ForceModelPrefix))
 		return
 	}
 
 	GlobalModelRegistry().UnregisterClient(a.ID)
+}
+
+func codexModelsForAccountType(accountType string) []*ModelInfo {
+	switch strings.ToLower(strings.TrimSpace(accountType)) {
+	case "free":
+		return registry.GetCodexFreeModels()
+	case "plus":
+		return registry.GetCodexPlusModels()
+	case "team", "business", "go", "enterprise", "edu", "education":
+		return registry.GetCodexTeamModels()
+	case "pro":
+		return registry.GetCodexProModels()
+	default:
+		return registry.GetCodexProModels()
+	}
 }
 
 // refreshModelRegistrationForAuth re-applies the latest model registration for
@@ -2378,6 +2428,39 @@ func applyExcludedModels(models []*ModelInfo, excluded []string) []*ModelInfo {
 		}
 		if !blocked {
 			filtered = append(filtered, model)
+		}
+	}
+	return filtered
+}
+
+// applyAllowedModels restricts models to an allowlist of case-insensitive
+// wildcard patterns. An empty allowlist intentionally returns no models.
+func applyAllowedModels(models []*ModelInfo, allowed []string) []*ModelInfo {
+	if len(models) == 0 || len(allowed) == 0 {
+		return nil
+	}
+
+	patterns := make([]string, 0, len(allowed))
+	for _, item := range allowed {
+		if trimmed := strings.ToLower(strings.TrimSpace(item)); trimmed != "" {
+			patterns = append(patterns, trimmed)
+		}
+	}
+	if len(patterns) == 0 {
+		return nil
+	}
+
+	filtered := make([]*ModelInfo, 0, len(models))
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		modelID := strings.ToLower(strings.TrimSpace(model.ID))
+		for _, pattern := range patterns {
+			if matchWildcard(pattern, modelID) {
+				filtered = append(filtered, model)
+				break
+			}
 		}
 	}
 	return filtered

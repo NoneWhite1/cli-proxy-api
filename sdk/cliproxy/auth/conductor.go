@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	codexauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
@@ -3132,38 +3131,7 @@ func disallowFreeAuthFromMetadata(meta map[string]any) bool {
 }
 
 func isFreeCodexAuth(auth *Auth) bool {
-	return strings.EqualFold(codexPlanTypeFromAuth(auth), "free")
-}
-
-func codexPlanTypeFromAuth(auth *Auth) string {
-	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
-		return ""
-	}
-	if auth.Attributes != nil {
-		if planType := strings.TrimSpace(auth.Attributes["plan_type"]); planType != "" {
-			return planType
-		}
-	}
-	if auth.Metadata == nil {
-		return ""
-	}
-	for _, key := range []string{"plan_type", "planType"} {
-		if value, ok := auth.Metadata[key].(string); ok {
-			if planType := strings.TrimSpace(value); planType != "" {
-				return planType
-			}
-		}
-	}
-	idToken, _ := auth.Metadata["id_token"].(string)
-	idToken = strings.TrimSpace(idToken)
-	if idToken == "" {
-		return ""
-	}
-	claims, err := codexauth.ParseJWTToken(idToken)
-	if err != nil || claims == nil {
-		return ""
-	}
-	return strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType)
+	return CodexAccountTypeFromAuth(auth) == "free"
 }
 
 func publishSelectedAuthMetadata(meta map[string]any, authID string) {
